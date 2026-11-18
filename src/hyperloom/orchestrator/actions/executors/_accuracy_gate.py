@@ -425,18 +425,32 @@ def parse_eval_results(
     return _lm_eval_accuracy_result(workspace)
 
 
+def _round_root_holding_warmup(workspace: Path) -> Path | None:
+    """The round directory above ``workspace`` that holds a warmup round, when one of the two nearest does."""
+    for ancestor in (workspace.parent, workspace.parent.parent):
+        if any((ancestor / name).is_dir() for name in ("warmup_round", "measure_round")):
+            return ancestor
+    return None
+
+
 def _lm_eval_accuracy_result(workspace: Path) -> dict[str, Any]:
-    """Read the accuracy score from the latest lm-eval results*.json under ``workspace``."""
-    search_paths = [
-        workspace / "eval_*" / "**" / "results*.json",
-        workspace / "**" / "results*.json",
-    ]
+    """Read the accuracy score from the latest lm-eval results*.json under ``workspace``.
+
+    A serving baseline whose measure round reuses the server its warmup round started has no eval of its own: the
+    eval ran in the warmup round, which sits beside it under the same round directory. The search therefore climbs
+    one level for those two round directories, preferring the measured round's own results when it has them.
+    """
+    roots = [workspace]
+    round_root = _round_root_holding_warmup(workspace)
+    if round_root is not None:
+        roots.append(round_root)
     result_files: list[Path] = []
-    for pattern in search_paths:
-        result_files.extend(Path(f) for f in glob.glob(str(pattern), recursive=True))
+    for root in roots:
+        for pattern in (root / "eval_*" / "**" / "results*.json", root / "**" / "results*.json"):
+            result_files.extend(Path(f) for f in glob.glob(str(pattern), recursive=True))
     # Prefer a non-warmup round, but fall back to the warmup's eval rather than reporting no accuracy at all.
     discarded_warmup_dirs = {"warmup_round", "mn_warmup"}
-    measured = [p for p in result_files if discarded_warmup_dirs.isdisjoint(p.relative_to(workspace).parts)]
+    measured = [p for p in result_files if discarded_warmup_dirs.isdisjoint(p.parts)]
     result_files = measured or result_files
     if not result_files:
         return {"accuracy": None, "error": f"no results*.json in {workspace}"}
