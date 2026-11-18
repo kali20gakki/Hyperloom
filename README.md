@@ -138,17 +138,18 @@ python -m hyperloom.orchestrator.trace_analysis.msagent_analysis \
 
 ```bash
 export HYPERLOOM_DEVICE_BACKEND=ascend
-export HYPERLOOM_SKIP_FRAMEWORK_CHECK=1          # 预检里的"是不是 ROCm 构建"探针
 export KERNEL_AGENT_ENV=<文件>                    # install.sh 本来会写的 kernel-agent env
-export HYPERLOOM_CODEX_SANDBOX_MODE=bypass       # 本机没有可用的 bubblewrap
 export INFERENCE_SUITE_TOOL_CACHE=<已铺设的缓存>
-export INFERENCE_OPTIMIZER_RAY_EXEC=0            # Ray 在 NPU 主机上看不到 GPU
-export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1   # 带 "[::1]" 的条目会让 httpx 解析失败
 
-python -m hyperloom optimize --framework vllm --gpu-type 910b3 --model <模型路径> \
+python -m hyperloom optimize --framework vllm --model <模型路径> \
     --reference-script serve.sh --tp 1 --conc 64 --isl 1024 --osl 1024 \
-    --max-hours 0.3 --no-kernel --no-enable-roofline --enablement off
+    --max-hours 1.0 --no-kernel --no-enable-roofline --enablement off
 ```
+
+原先要靠环境变量绕过的几个主机侧问题，现在由代码处理：构建探针在昇腾上问的是 `torch_npu` 能否看到
+NPU（不再是“是不是 ROCm 构建”）、NPU 主机上 Ray 默认关闭、启动时丢弃 httpx 解析不了的 `no_proxy`
+条目、板卡通过 `npu-smi` 自动识别。codex 自带的沙箱需要 bubblewrap：装它（`apt install bubblewrap`），
+或在专用容器里设 `HYPERLOOM_CODEX_SANDBOX_MODE=bypass`。
 
 编排与评审角色跑在网关模型上（`INFERENCE_OPTIMIZER_AGENT_BACKEND=codex`、`CODEX_MODEL=<模型>`）。运行会解析
 参考启动脚本、拉起 vLLM-Ascend 服务、测出基线轮并通过精度门，然后正常收尾。单卡基线一次要 15–20 分钟

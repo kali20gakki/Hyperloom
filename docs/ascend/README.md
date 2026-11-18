@@ -142,17 +142,19 @@ share one implementation.
 
 ```bash
 export HYPERLOOM_DEVICE_BACKEND=ascend
-export HYPERLOOM_SKIP_FRAMEWORK_CHECK=1          # the preflight's "is this a ROCm build" probe
 export KERNEL_AGENT_ENV=<file>                   # the kernel-agent env install.sh normally writes
-export HYPERLOOM_CODEX_SANDBOX_MODE=bypass       # no working bubblewrap on this host
 export INFERENCE_SUITE_TOOL_CACHE=<staged cache>
-export INFERENCE_OPTIMIZER_RAY_EXEC=0            # Ray sees no GPUs on an NPU host
-export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1   # a "[::1]" entry breaks httpx parsing
 
-python -m hyperloom optimize --framework vllm --gpu-type 910b3 --model <model path> \
+python -m hyperloom optimize --framework vllm --model <model path> \
     --reference-script serve.sh --tp 1 --conc 64 --isl 1024 --osl 1024 \
-    --max-hours 0.3 --no-kernel --no-enable-roofline --enablement off
+    --max-hours 1.0 --no-kernel --no-enable-roofline --enablement off
 ```
+
+The host details this used to need variables for are now decided by the code: the build probe asks whether
+`torch_npu` sees an NPU instead of whether torch is a ROCm build, Ray is off by default on an NPU host,
+`no_proxy` entries httpx cannot parse are dropped at startup, and the board is read through `npu-smi`.
+Codex's own sandbox needs bubblewrap: install it (`apt install bubblewrap`), or set
+`HYPERLOOM_CODEX_SANDBOX_MODE=bypass` on a dedicated container.
 
 The orchestration and critic roles run on the gateway model (`INFERENCE_OPTIMIZER_AGENT_BACKEND=codex`,
 `CODEX_MODEL=<model>`). The run resolves the reference launch, boots the vLLM-Ascend server, measures the baseline
