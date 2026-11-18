@@ -16,11 +16,17 @@ the two aiperf files staging patches so the harness exports ``error_osl``.
 The file manifest names bytes, some of which hold the directory the staging was built in; what two hosts compare is
 :func:`normalised_manifest`, the staging's identity with every path left out, and the lm-eval this interpreter runs.
 
-``python -m inference_suite.staging stage --source <InferenceX repository> --tool-cache <dir>`` stages; without
-``--source`` it stages nothing and only completes a cache that already verifies. Either installs the pinned lm-eval
-into the interpreter running it, from the sealed runner's hash lock (:func:`runner_lock`). ``check --tool-cache <dir>``
-reports whether a round could identify the staging: the cache holds the current pins intact and the interpreter running
-it has the pinned lm-eval.
+That environment is a build of one CPU architecture and a lock of wheels for one platform, and only a load that runs
+the AgentX harness reads it. :class:`StagingProfile` says which of the two a staging is built for:
+``inferencex`` stages the InferenceX subset alone, which is all a round that drives the server itself reads, and
+:func:`profile_for` maps a workload kind to it. A cache staged for one profile refuses a round of the other, because
+:func:`verify` lists the files that round's profile requires and the manifest does not hold.
+
+``python -m inference_suite.staging stage --source <InferenceX repository> --tool-cache <dir> [--profile <name>]``
+stages; without ``--source`` it stages nothing and only completes a cache that already verifies. Either installs the
+pinned lm-eval into the interpreter running it, from the sealed runner's hash lock (:func:`runner_lock`).
+``check --tool-cache <dir> [--profile <name>]`` reports whether a round could identify the staging: the cache holds the
+current pins intact and the interpreter running it has the pinned lm-eval.
 :func:`ensure_staged`, behind ``python -m inference_suite stage`` and this package's ``install.sh``, stages only what
 a cache lacks.
 
@@ -49,6 +55,7 @@ import tempfile
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
 
@@ -57,6 +64,7 @@ from hyperloom_common.io import SHARED, atomic_write_bytes
 from hyperloom_common.shared_storage import make_shared_dirs
 from inference_suite import aiperf_patch, client_env
 from inference_suite.client_env import CLIENT_PYTHON, PATCHED_FILES, ClientEnvError
+from inference_suite.contracts.config import WorkloadKind
 from inference_suite.contracts.normalised import NormalisedManifest, PackageIdentity
 from inference_suite.contracts.report import FailedStep
 from inference_suite.pins import (
@@ -105,6 +113,38 @@ INFERENCEX_SUBSET = (
 #: The files a staged InferenceX must hold for a round to run, whatever else its subset holds at the pin. The patched
 #: client files are among them, so a staging made before the patch is staged again.
 INFERENCEX_REQUIRED = (CLIENT_FILE, GSM8K_TASK, AGENTX_AGGREGATOR_FILE, AGENTX_PYTHON, *PATCHED_FILES)
+
+
+class StagingProfile(str, Enum):
+    """What a staging is built for.
+
+    ``AGENTX`` is the full staging: InferenceX's subset plus the pinned AgentX client environment. ``INFERENCEX``
+    stops at the subset, which is all a load that drives the server directly reads. The client environment is a
+    separate CPython build and a lock of wheels for one platform, so a host that cannot run that build can still stage
+    the subset and measure the loads that do not need it.
+    """
+
+    AGENTX = "agentx"
+    INFERENCEX = "inferencex"
+
+
+#: The files each profile requires from the staged InferenceX.
+_REQUIRED_BY_PROFILE: Mapping[StagingProfile, tuple[str, ...]] = MappingProxyType(
+    {
+        StagingProfile.AGENTX: INFERENCEX_REQUIRED,
+        StagingProfile.INFERENCEX: (CLIENT_FILE, GSM8K_TASK),
+    }
+)
+
+#: The workloads whose load runs the AgentX client.
+_AGENTX_LOADS = frozenset({WorkloadKind.AGENTX, WorkloadKind.MLPERF})
+
+
+def profile_for(workload: WorkloadKind) -> StagingProfile:
+    """The staging profile a round of ``workload`` reads."""
+    return StagingProfile.AGENTX if workload in _AGENTX_LOADS else StagingProfile.INFERENCEX
+
+
 #: The prefix of a staging :func:`publish` has not renamed into place yet; no reader looks below one.
 PUBLISHING_PREFIX = ".staging-"
 
@@ -229,10 +269,10 @@ def _unpinned(manifest: StagingManifest) -> Iterator[str]:
             yield f"{name} at its pin {pin} ({found})"
 
 
-def _incomplete(manifest: StagingManifest) -> Iterator[str]:
+def _incomplete(manifest: StagingManifest, profile: StagingProfile) -> Iterator[str]:
     staged = manifest.tools.get(INFERENCEX_TOOL)
     if staged is not None:
-        for required in INFERENCEX_REQUIRED:
+        for required in _REQUIRED_BY_PROFILE[profile]:
             if required not in staged.files:
                 yield f"{INFERENCEX_TOOL}'s {required} (not staged)"
 
@@ -260,11 +300,11 @@ def manifest_sha256(tool_cache: Path) -> str | None:
         return None
 
 
-def verified_manifest_sha256(tool_cache: Path) -> str | None:
+def verified_manifest_sha256(tool_cache: Path, *, profile: StagingProfile = StagingProfile.AGENTX) -> str | None:
     """The sha256 of the manifest ``tool_cache`` holds when the cache verifies against the pins in force; ``None``
     when it does not, or holds no manifest."""
     digest = manifest_sha256(tool_cache)
-    if digest is None or verify(tool_cache, digest).failed_step is not None:
+    if digest is None or verify(tool_cache, digest, profile=profile).failed_step is not None:
         return None
     return digest
 
@@ -277,8 +317,9 @@ def _parse_manifest(path: Path, data: bytes) -> StagingManifest | str:
         return f"a readable staging manifest at {path} ({exc})"
 
 
-def verify(tool_cache: Path, manifest_sha256: str) -> StagingReport:
-    """Check ``tool_cache`` against the manifest whose sha256 is ``manifest_sha256`` and the pins in force."""
+def verify(tool_cache: Path, manifest_sha256: str, *, profile: StagingProfile = StagingProfile.AGENTX) -> StagingReport:
+    """Check ``tool_cache`` against the manifest whose sha256 is ``manifest_sha256``, the pins in force, and the files
+    ``profile`` reads."""
     path = tool_cache / MANIFEST_FILE
     if not path.is_file():
         return StagingReport(manifest_sha256, {}, (_absent_manifest(path),))
@@ -291,7 +332,9 @@ def verify(tool_cache: Path, manifest_sha256: str) -> StagingReport:
         return StagingReport(manifest_sha256, {}, (manifest,))
     pins = {name: tool.commit for name, tool in manifest.tools.items()}
     return StagingReport(
-        manifest_sha256, pins, (*_unpinned(manifest), *_incomplete(manifest), *_damaged(tool_cache, manifest))
+        manifest_sha256,
+        pins,
+        (*_unpinned(manifest), *_incomplete(manifest, profile), *_damaged(tool_cache, manifest)),
     )
 
 
@@ -330,9 +373,10 @@ def _run_staging_step(argv: Sequence[str], what: str) -> None:
         raise StagingError(f"{what} exited with code {done.returncode}: {done.stderr.strip()[-2000:]}")
 
 
-def stage(source: Path, tool_cache: Path) -> str:
-    """Copy InferenceX's subset as committed at its pin in the repository ``source`` into ``tool_cache`` and build the
-    AgentX client environment beside it from the pinned build and lock, both downloaded; returns the manifest's sha256.
+def stage(source: Path, tool_cache: Path, *, profile: StagingProfile = StagingProfile.AGENTX) -> str:
+    """Copy InferenceX's subset as committed at its pin in the repository ``source`` into ``tool_cache``; with
+    ``profile`` ``AGENTX``, also build the AgentX client environment beside it from the pinned build and lock, both
+    downloaded. Returns the manifest's sha256.
 
     Raises:
         StagingError: ``source`` is not a repository holding the pinned commit, the commit lacks part of the subset, or
@@ -348,15 +392,19 @@ def stage(source: Path, tool_cache: Path) -> str:
         for path in sorted(partial.rglob("*"))
         if path.is_file()
     }
-    try:
-        with tempfile.TemporaryDirectory(dir=tool_cache, prefix=".inputs-") as inputs:
-            client_env.fetch_inputs(Path(inputs))
-            client_env.install(Path(inputs), partial)
-    except ClientEnvError as exc:
-        raise StagingError(str(exc)) from exc
-    files.update(
-        {path.relative_to(partial).as_posix(): _sha256(path.read_bytes()) for path in client_env.staged_files(partial)}
-    )
+    if profile is StagingProfile.AGENTX:
+        try:
+            with tempfile.TemporaryDirectory(dir=tool_cache, prefix=".inputs-") as inputs:
+                client_env.fetch_inputs(Path(inputs))
+                client_env.install(Path(inputs), partial)
+        except ClientEnvError as exc:
+            raise StagingError(str(exc)) from exc
+        files.update(
+            {
+                path.relative_to(partial).as_posix(): _sha256(path.read_bytes())
+                for path in client_env.staged_files(partial)
+            }
+        )
     shutil.rmtree(root, ignore_errors=True)
     os.replace(partial, root)
     manifest = StagingManifest({INFERENCEX_TOOL: StagedTool(pin, files)})
@@ -411,14 +459,15 @@ def _install_lm_eval() -> None:
     _run_staging_step([*install, "--require-hashes", "--requirement", str(lock)], f"installing {LM_EVAL_REQUIREMENT}")
 
 
-def _intact_digest(tool_cache: Path) -> str | None:
-    """The manifest's sha256 when ``tool_cache`` holds the pinned tools intact; ``None`` when it is to be staged.
+def _intact_digest(tool_cache: Path, profile: StagingProfile) -> str | None:
+    """The manifest's sha256 when ``tool_cache`` holds the pinned tools ``profile`` reads intact; ``None`` when it is
+    to be staged.
 
     Raises:
         StagingError: a staged file was removed or edited, or the manifest does not parse.
     """
     digest = manifest_sha256(tool_cache)
-    if digest is None or verify(tool_cache, digest).failed_step is None:
+    if digest is None or verify(tool_cache, digest, profile=profile).failed_step is None:
         return digest
     path = tool_cache / MANIFEST_FILE
     manifest = _parse_manifest(path, path.read_bytes())
@@ -436,8 +485,9 @@ def _fetch_inferencex(repository: Path) -> None:
     _run_staging_step(fetch, f"fetching InferenceX {pin}")
 
 
-def ensure_staged(tool_cache: Path, source: Path | None) -> str:
-    """Stage the pinned tools into ``tool_cache`` unless it holds them intact; returns the manifest's sha256.
+def ensure_staged(tool_cache: Path, source: Path | None, *, profile: StagingProfile = StagingProfile.AGENTX) -> str:
+    """Stage the pinned tools ``profile`` reads into ``tool_cache`` unless it holds them intact; returns the
+    manifest's sha256.
 
     A cache whose manifest verifies stages nothing. One staged at a pin no longer in force, or without a file a load
     now runs, is staged again. One whose staged files were removed or edited, or whose manifest does not parse, is
@@ -449,29 +499,29 @@ def ensure_staged(tool_cache: Path, source: Path | None) -> str:
             the cache directory is unavailable.
     """
     try:
-        return _stage_unless_intact(tool_cache, source)
+        return _stage_unless_intact(tool_cache, source, profile)
     except OSError as exc:
         raise StagingError(f"staging into {tool_cache} failed: {exc}") from exc
 
 
-def _stage_unless_intact(tool_cache: Path, source: Path | None) -> str:
-    digest = _intact_digest(tool_cache)
+def _stage_unless_intact(tool_cache: Path, source: Path | None, profile: StagingProfile) -> str:
+    digest = _intact_digest(tool_cache, profile)
     _install_lm_eval()
     if digest is not None:
         return digest
     tool_cache.mkdir(parents=True, exist_ok=True)
-    return _stage_from(source, tool_cache)
+    return _stage_from(source, tool_cache, profile)
 
 
-def _stage_from(source: Path | None, tool_cache: Path) -> str:
+def _stage_from(source: Path | None, tool_cache: Path, profile: StagingProfile) -> str:
     """:func:`stage` from the repository ``source``, or from InferenceX fetched at its pin into ``tool_cache``."""
     if source is not None:
-        return stage(source, tool_cache)
+        return stage(source, tool_cache, profile=profile)
     repository = tool_cache / f".source-{PINNED_TOOLS[INFERENCEX_TOOL]}"
     shutil.rmtree(repository, ignore_errors=True)
     try:
         _fetch_inferencex(repository)
-        return stage(repository, tool_cache)
+        return stage(repository, tool_cache, profile=profile)
     finally:
         shutil.rmtree(repository, ignore_errors=True)
 
@@ -566,7 +616,8 @@ def _publish(stagings: Path, source: Path | None) -> Path:
         return published
     private = make_shared_dirs(stagings / f"{PUBLISHING_PREFIX}{key}-{uuid.uuid4().hex}")
     try:
-        _stage_from(source, private)
+        # A published staging is the full one: its identity compares the AgentX client environment across hosts.
+        _stage_from(source, private, StagingProfile.AGENTX)
         staged = _staged_identity(private)
         _fsync_tree(private)
     except BaseException:
@@ -588,15 +639,15 @@ def _publish(stagings: Path, source: Path | None) -> Path:
     return published
 
 
-def _cache_report(tool_cache: Path) -> StagingReport:
-    """:func:`verify` against whatever manifest ``tool_cache`` holds."""
+def _cache_report(tool_cache: Path, profile: StagingProfile) -> StagingReport:
+    """:func:`verify` against whatever manifest ``tool_cache`` holds, for ``profile``."""
     digest = manifest_sha256(tool_cache)
     if digest is None:
         return StagingReport("", {}, (_absent_manifest(tool_cache / MANIFEST_FILE),))
-    return verify(tool_cache, digest)
+    return verify(tool_cache, digest, profile=profile)
 
 
-def _stage_command(tool_cache: Path, source: Path | None) -> str:
+def _stage_command(tool_cache: Path, source: Path | None, profile: StagingProfile) -> str:
     """:func:`stage` from ``source``, or with none, the digest of ``tool_cache`` as it verifies; either way with the
     pinned lm-eval installed into this interpreter.
 
@@ -604,14 +655,27 @@ def _stage_command(tool_cache: Path, source: Path | None) -> str:
         StagingError: with no ``source``, the cache does not verify; or a tool cannot be staged or installed.
     """
     if source is None:
-        report = _cache_report(tool_cache)
+        report = _cache_report(tool_cache, profile)
         if report.failed_step is not None:
             raise StagingError(report.detail)
         _install_lm_eval()
         return report.manifest_sha256
     _install_lm_eval()
     tool_cache.mkdir(parents=True, exist_ok=True)
-    return stage(source, tool_cache)
+    return stage(source, tool_cache, profile=profile)
+
+
+def _profile_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--profile",
+        type=StagingProfile,
+        choices=tuple(StagingProfile),
+        default=StagingProfile.AGENTX,
+        help=(
+            "agentx stages the full staging, including the pinned AgentX client environment; inferencex stages the "
+            "InferenceX subset alone, which is all a round that drives the server directly reads"
+        ),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -628,19 +692,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="an InferenceX repository holding the pinned commit; when omitted, the cache must already verify",
     )
     stage_parser.add_argument("--tool-cache", type=Path, required=True)
+    _profile_argument(stage_parser)
     check_parser = commands.add_parser(
         "check", help="verify the tool cache against the pins in force and this interpreter's lm-eval against its pin"
     )
     check_parser.add_argument("--tool-cache", type=Path, required=True)
+    _profile_argument(check_parser)
     args = parser.parse_args(argv)
     if args.command == "stage":
         try:
-            print(_stage_command(args.tool_cache, args.source))
+            print(_stage_command(args.tool_cache, args.source, args.profile))
         except StagingError as exc:
             print(f"{FailedStep.STAGING_MISSING.value}: {exc}", file=sys.stderr)
             return 1
         return 0
-    report = _cache_report(args.tool_cache)
+    report = _cache_report(args.tool_cache, args.profile)
     off_pin = _lm_eval_off_pin()
     missing = report.missing if off_pin is None else (*report.missing, off_pin)
     if missing:

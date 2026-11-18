@@ -283,7 +283,7 @@ class _Rig:
             ),
         )
         self.staging = StagingReport(_SHA, dict(PINNED_TOOLS), ())
-        monkeypatch.setattr(run.staging, "verify", lambda *_args: self.staging)
+        monkeypatch.setattr(run.staging, "verify", lambda *_args, **_kwargs: self.staging)
         self.busy_gpus: str | None = None
         monkeypatch.setattr(
             runtime_server,

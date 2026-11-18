@@ -43,7 +43,7 @@ from inference_suite.recipe.user_file import parse_user_file
 from inference_suite.run import run_round
 from inference_suite.runtime.process import PidfileError
 from inference_suite.runtime.server import stop
-from inference_suite.staging import StagingError, ensure_staged, publish
+from inference_suite.staging import StagingError, StagingProfile, ensure_staged, publish
 
 PROG = "python -m inference_suite"
 EXIT_OK = 0
@@ -129,7 +129,7 @@ def _resolve(args: argparse.Namespace) -> int:
 
 def _stage(args: argparse.Namespace) -> int:
     try:
-        digest = ensure_staged(args.tool_cache, args.source)
+        digest = ensure_staged(args.tool_cache, args.source, profile=args.profile)
     except StagingError as exc:
         return _refused(f"{FailedStep.STAGING_MISSING.value}: {exc}")
     print(digest)
@@ -174,6 +174,16 @@ def _parser() -> argparse.ArgumentParser:
     stage_parser.add_argument("--tool-cache", type=Path, required=True, help="the tool cache rounds verify")
     stage_parser.add_argument(
         "--source", type=Path, help="an InferenceX repository holding the pinned commit; fetched when omitted"
+    )
+    stage_parser.add_argument(
+        "--profile",
+        type=StagingProfile,
+        choices=tuple(StagingProfile),
+        default=StagingProfile.AGENTX,
+        help=(
+            "agentx stages the full staging, including the pinned AgentX client environment; inferencex stages the "
+            "InferenceX subset alone, which is all a round that drives the server directly reads"
+        ),
     )
     stage_parser.set_defaults(handler=_stage)
     publish_parser = commands.add_parser(

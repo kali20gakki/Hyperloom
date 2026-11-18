@@ -355,7 +355,11 @@ class _Round:
             self.fail(stop)
 
     def _run(self, config_sha256: str) -> Stop | None:
-        staged = staging.verify(self.tool_cache, self.config.paths.tool_manifest_sha256)
+        staged = staging.verify(
+            self.tool_cache,
+            self.config.paths.tool_manifest_sha256,
+            profile=staging.profile_for(self.config.workload),
+        )
         if staged.missing:
             return Stop(FailedStep.STAGING_MISSING, staged.detail)
         stop = _changed_source_files(self.config)
