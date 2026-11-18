@@ -800,6 +800,36 @@ def _record_missing_traces(result: dict[str, Any], workspace: Path, workspace_st
         )
 
 
+#: The directory a torch_npu profiler capture writes, and the suffix of the capture directory holding it.
+_ASCEND_OUTPUT_DIR = "ASCEND_PROFILER_OUTPUT"
+_ASCEND_CAPTURE_SUFFIX = "_ascend_pt"
+
+
+def _ascend_capture(workspace: Path) -> Path | None:
+    """The Ascend profiler capture this run left under ``workspace``, or ``None`` on a host that wrote none.
+
+    torch_npu writes ``<name>_ascend_pt/ASCEND_PROFILER_OUTPUT`` — a SQLite database and CSVs, not a Kineto
+    ``*.trace.json.gz`` — so a capture is recognized by that directory rather than by a trace file.
+    """
+    for candidate in sorted(workspace.rglob("*" + _ASCEND_CAPTURE_SUFFIX)):
+        if candidate.is_dir() and (candidate / _ASCEND_OUTPUT_DIR).is_dir():
+            return candidate
+    if (workspace / _ASCEND_OUTPUT_DIR).is_dir():
+        return workspace
+    return None
+
+
+def _record_ascend_capture(result: dict[str, Any], capture: Path) -> None:
+    """Record an Ascend capture as this round's trace: the analysis route reads its database and CSVs."""
+    result["trace_dir"] = str(capture)
+    result["trace_files"] = []
+    result["main_trace_path"] = str(capture)
+    result["capture_format"] = "ascend_pt"
+    result["profile_trace_selection_reason"] = "ascend_pt_capture"
+    result["trace_health"] = {"issues": [], "checks": [], "capture_traces_present": False, "zero_ops": False}
+    log.info("profile_executor: Ascend capture %s (no Kineto trace on this host)", capture)
+
+
 # Attaches the single-node trace dir this run produced, and certifies it.
 def _record_workspace_traces(result: dict[str, Any], workspace_str: str, framework: str, preflight: Any) -> None:
     workspace = Path(workspace_str)
@@ -809,6 +839,10 @@ def _record_workspace_traces(result: dict[str, Any], workspace_str: str, framewo
         trace_dir, trace_files = _first_trace_dir_with(workspace, _capture_sidecar_traces_for_dir)
         capture_only = trace_dir is not None
     if trace_dir is None:
+        ascend = _ascend_capture(workspace)
+        if ascend is not None:
+            _record_ascend_capture(result, ascend)
+            return
         _record_missing_traces(result, workspace, workspace_str)
         return
     result["trace_dir"] = str(trace_dir)

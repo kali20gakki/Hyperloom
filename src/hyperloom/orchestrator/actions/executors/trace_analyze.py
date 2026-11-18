@@ -619,6 +619,13 @@ def _invalid_route_result(requested_route: str) -> dict[str, Any]:
     }
 
 
+def _default_route(trace_input: Any) -> AnalysisRoute:
+    """The route a request that names none takes: an Ascend capture goes to the msagent one, the rest to TraceLens."""
+    from hyperloom.orchestrator.trace_analysis.msagent_analysis import is_ascend_capture
+
+    return AnalysisRoute.MSAGENT if is_ascend_capture(str(trace_input or "")) else AnalysisRoute.AGENT
+
+
 async def _run_msagent_analysis(
     payload: dict, trace_input: Any, workspace_path: str, framework: str, session_dir: Path
 ) -> HandlerResult:
@@ -724,7 +731,7 @@ async def trace_analyze_handler(
     # An explicit unknown route is a configuration error. Falling back to
     # ``agent`` could turn a no-LLM request into a paid model session.
     try:
-        analysis_route = AnalysisRoute(requested_route) if requested_route else AnalysisRoute.AGENT
+        analysis_route = AnalysisRoute(requested_route) if requested_route else _default_route(trace_input)
     except ValueError:
         return _invalid_route_result(requested_route)
     workspace_path = payload.get("workspace_path") or str(session_dir)

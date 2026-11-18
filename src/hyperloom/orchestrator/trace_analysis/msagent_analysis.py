@@ -60,6 +60,10 @@ MCP_COMMAND_ENV = "HYPERLOOM_MSPROF_MCP"
 SKILL_CHARS = 6000
 
 
+#: The suffix torch_npu gives a capture directory (``rank0_..._ascend_pt``).
+_ASCEND_CAPTURE_SUFFIX = "_ascend_pt"
+
+
 class AnalysisError(RuntimeError):
     """The capture, the agent turn, or what it wrote does not meet the contract."""
 
@@ -74,6 +78,17 @@ class Capture:
     kernels: Path
     ops: Path | None
     config: Path | None
+
+
+def is_ascend_capture(trace_dir: Path | str) -> bool:
+    """Whether ``trace_dir`` names a torch_npu profiler capture: ``*_ascend_pt`` or the output directory itself."""
+    path = Path(trace_dir)
+    if path.name == CAPTURE_OUTPUT_DIR or path.name.endswith(_ASCEND_CAPTURE_SUFFIX):
+        return True
+    try:
+        return path.is_dir() and (path / CAPTURE_OUTPUT_DIR).is_dir()
+    except OSError:
+        return False
 
 
 def discover_capture(trace_dir: Path) -> Capture:
