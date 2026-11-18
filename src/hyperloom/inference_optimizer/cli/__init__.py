@@ -1746,6 +1746,14 @@ async def _close_optimize_run(coordinator: Any, session_lock: Any, session_dir: 
             log.exception("failed to persist post-stop state (non-fatal)")
 
 
+def _existing_path(value: str) -> bool:
+    """Whether ``value`` names an existing path; a prompt too long to be one answers ``False``."""
+    try:
+        return Path(value).exists()
+    except OSError:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point: parse arguments and dispatch the requested subcommand."""
     # Force line-buffering so output piped through a non-TTY sink flushes every line immediately instead of
@@ -1768,10 +1776,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "optimize":
         dump_thread_stacks_on_sigusr1()
         agent_isolation.announce_agent_isolation()  # before any agent runs: the WARNING and the report's line
-        # Resolve any --*-prompt that point at a file.
+        # Resolve any --*-prompt that point at a file. A prompt is usually a sentence, so the path test must treat an
+        # unexaminable string as text rather than fail on it: a long prompt is not a long file name.
         for attr in ("orch_prompt", "critic_prompt"):
             v = getattr(args, attr)
-            if v and Path(v).exists():
+            if v and _existing_path(v):
                 setattr(args, attr, Path(v).read_text(encoding="utf-8"))
         try:
             configure_benchmark(args)
