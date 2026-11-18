@@ -120,8 +120,58 @@ _VLLM_ROCM_PROBE_TIMEOUT_SEC = 120
 
 
 def _rocm_evidence(framework: str) -> str:
-    """Name the signal the ROCm verdict for ``framework`` rests on."""
+    """Name the signal the build verdict for ``framework`` rests on."""
+    if _accelerator_kind() == "NPU":
+        return "torch_npu"
     return "the vllm platform" if framework == "vllm" else "torch.version.hip"
+
+
+def _accelerator_kind() -> str:
+    """The build a serving framework must be on this host: ``ROCm`` on an AMD GPU host, ``NPU`` on an Ascend one."""
+    from hyperloom_common.device_backend import is_ascend
+
+    return "NPU" if is_ascend() else "ROCm"
+
+
+def _probe_npu_build(framework: str, python_exe: str) -> _Probe:
+    """Tri-state: does the Ascend stack behind ``framework`` in ``python_exe`` import and see an NPU?"""
+    probe = "\n".join(
+        [
+            "import sys",
+            "def verdict():",
+            "    import torch, torch_npu  # noqa: F401",
+            "    return 0 if torch.npu.is_available() else 1",
+            "try:",
+            "    code = verdict()",
+            "except BaseException:",
+            "    import traceback; traceback.print_exc()",
+            "    code = 3",
+            "sys.exit(code)",
+        ]
+    )
+    try:
+        proc = subprocess.run(
+            [python_exe, "-c", probe],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=_VLLM_ROCM_PROBE_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _Probe(None, _probe_failure_detail(exc), isinstance(exc, subprocess.TimeoutExpired))
+    detail = _probe_stderr_tail(getattr(proc, "stderr", ""))
+    if proc.returncode == 0:
+        return _Probe(True, detail)
+    if proc.returncode == 1:
+        return _Probe(False, detail)
+    return _Probe(None, detail)
+
+
+def _probe_accelerator_build(framework: str, python_exe: str) -> _Probe:
+    """The probe this host's framework has to pass: the ROCm one, or the NPU one."""
+    if _accelerator_kind() == "NPU":
+        return _probe_npu_build(framework, python_exe)
+    return _probe_rocm_build(framework, python_exe)
 
 
 def _probe_rocm_build(framework: str, python_exe: str) -> _Probe:
@@ -221,7 +271,7 @@ def _resolve_framework_build(framework: str, interpreters: list[str]) -> tuple[s
             # here.
             missing = missing if missing.detail else found
             continue
-        probe = _probe_rocm_build(framework, python_exe)
+        probe = _probe_accelerator_build(framework, python_exe)
         if probe.verdict is True:
             return python_exe, probe
         if probe.verdict is None:
@@ -240,8 +290,9 @@ def _report_framework_probe(
 ) -> dict[str, Any]:
     """Report a usable or unverifiable probe; anything else goes to ``_report_unusable_framework``."""
     evidence = _rocm_evidence(framework)
+    kind = _accelerator_kind()
     if found and probe.verdict is True:
-        print(f"Preflight: {framework} importable ({found}); {evidence} confirms a ROCm build")
+        print(f"Preflight: {framework} importable ({found}); {evidence} confirms a {kind} build")
         return {
             "status": "applied",
             "skip_reason": None,
@@ -285,11 +336,12 @@ def _report_unusable_framework(
 ) -> dict[str, Any]:
     """Warn about, or stop the run on, a serving framework that is missing here or is not a ROCm build."""
     evidence = _rocm_evidence(framework)
+    kind = _accelerator_kind()
     # Every path below stops the run, so it needs a remedy that works.
     probed = "\n".join(f"  - {python_exe}" for python_exe in interpreters)
     if framework not in _SETUP_INSTALLABLE_FRAMEWORKS:
         state = (
-            f"is importable ({found}) but {evidence} says it is not a ROCm build"
+            f"is importable ({found}) but {evidence} says it is not a {kind} build"
             if found
             else f"is not importable by:\n{probed}"
         )
@@ -309,10 +361,10 @@ def _report_unusable_framework(
 
     if found:
         print(
-            f"\nERROR: {framework} is importable ({found}) but {evidence} says it is NOT a ROCm build."
+            f"\nERROR: {framework} is importable ({found}) but {evidence} says it is NOT a {kind} build."
             f"{_probe_detail_block(probe.detail)}\n\n"
             "The wheels on PyPI are the CUDA build: they import fine and then fail\n"
-            "at GPU init. Reinstall the ROCm stack:\n"
+            f"at device init. Reinstall the {kind} stack:\n"
             f"    {_setup_install_command(framework)}\n\n"
             f"To proceed anyway, set {SKIP_FRAMEWORK_CHECK_ENV}=1.",
             file=sys.stderr,

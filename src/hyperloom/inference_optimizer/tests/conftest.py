@@ -887,3 +887,14 @@ def heartbeat_orchestration_with_mock_critic() -> dict[str, object]:
         "orchestration": MockBackend(silent, name="orch"),
         "critic": MockCriticBackend(),
     }
+
+
+@pytest.fixture(autouse=True)
+def _amd_device_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This package's tests describe an AMD GPU host.
+
+    ``hyperloom_common.device_backend`` reads the host, and CI runs on whatever host the job got. Pinning it here keeps
+    the ROCm probes, board policies and device gates under test about the backend their assertions name; a test that
+    needs Ascend sets the variable itself.
+    """
+    monkeypatch.setenv("HYPERLOOM_DEVICE_BACKEND", "amd")

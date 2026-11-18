@@ -38,6 +38,19 @@ _RAY_PLACED_GPUS_VAR = _RAY_OWNED_VISIBLE_DEVICE_VARS[0]
 _UTF8 = "utf-8"
 
 
+def _ray_exec_default() -> bool:
+    """Whether Ray is the default executor here: off under pytest, and off on an Ascend host.
+
+    Ray accounts for accelerators as GPUs, so a host whose devices are NPUs reports zero of them and every round
+    would be refused for want of a GPU. Such a host runs the rounds in-process instead.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    from hyperloom_common.device_backend import is_ascend
+
+    return not is_ascend()
+
+
 def ray_exec_enabled() -> bool:
     """Whether serving and ``needs_gpu`` specialist work runs through the Ray backend.
 
@@ -49,7 +62,7 @@ def ray_exec_enabled() -> bool:
 
     if is_multi_node():
         return False
-    if not env_flag("INFERENCE_OPTIMIZER_RAY_EXEC", default=not os.environ.get("PYTEST_CURRENT_TEST")):
+    if not env_flag("INFERENCE_OPTIMIZER_RAY_EXEC", default=_ray_exec_default()):
         return False
     return _ray_runtime.ray_head_answers_driver()
 

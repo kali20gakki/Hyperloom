@@ -43,6 +43,7 @@ from inference_suite.recipe.user_file import parse_user_file
 from inference_suite.run import run_round
 from inference_suite.runtime.process import PidfileError
 from inference_suite.runtime.server import stop
+from hyperloom_common.env import sanitize_no_proxy
 from inference_suite.staging import StagingError, StagingProfile, ensure_staged, publish
 
 PROG = "python -m inference_suite"
@@ -198,6 +199,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # A round builds HTTP clients (the load client, the eval) under the inherited environment.
+    sanitize_no_proxy()
     args = _parser().parse_args(argv)
     return int(args.handler(args))
 

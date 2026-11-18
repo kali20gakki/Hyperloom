@@ -22,7 +22,7 @@ run. :func:`env_flag` is the opt-in lenient variant its callers already chose.
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 
 _TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 # Canonical "off" vocabulary. The empty string is an explicit off token: a
@@ -94,6 +94,31 @@ def env_flag(name: str, default: bool = False) -> bool:
     """
     raw = os.environ.get(name)
     return is_truthy(raw, default=default)
+
+
+def sanitize_no_proxy(environ: MutableMapping[str, str] | None = None) -> bool:
+    """Drop the ``no_proxy`` entries httpx cannot parse; returns whether anything was dropped.
+
+    httpx reads each entry as ``host[:port]``, so a bracketed IPv6 literal turns into host ``[`` and port ``:1]`` and
+    every client built with ``trust_env`` raises ``InvalidURL`` — which surfaces far from the variable that caused it
+    (a model-catalog probe, an accuracy eval). The entries that survive still bypass the proxy for the hosts they
+    name, and an empty result leaves the variable unset.
+    """
+    target = os.environ if environ is None else environ
+    changed = False
+    for name in ("no_proxy", "NO_PROXY"):
+        raw = target.get(name)
+        if raw is None:
+            continue
+        kept = [entry.strip() for entry in raw.split(",") if entry.strip() and "[" not in entry and "]" not in entry]
+        replacement = ",".join(kept)
+        if replacement != raw:
+            changed = True
+            if replacement:
+                target[name] = replacement
+            else:
+                target.pop(name, None)
+    return changed
 
 
 def env_int(name: str, default: int = 0) -> int:
