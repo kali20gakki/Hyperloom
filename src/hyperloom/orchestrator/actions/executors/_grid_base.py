@@ -522,6 +522,33 @@ def _xdit_default_grid() -> list[GridVariant]:
     return variants
 
 
+def _vllm_ascend_default_grid(
+    *,
+    model_class: str,
+    conc: int,
+) -> list[GridVariant]:
+    """vLLM-Ascend default explore grid: the levers a profile of a bandwidth-bound decode supports.
+
+    Every variant is a switch vLLM-Ascend accepts; a flag its parser refuses fails that variant alone. The seed exists
+    because the orchestration model has to name a grid on vLLM, and the Ascend levers are known well enough to seed
+    them: graph mode, the reserve-ISL scheduler switch, the batch caps, and prefix caching as the contrast.
+    """
+    variants: list[GridVariant] = []
+
+    def _add(name: str, args: str) -> None:
+        gv = GridVariant(name=name, extra_server_args=args, extra_envs={}, note="default_grid")
+        gv.provenance = "default_grid"  # type: ignore[attr-defined]
+        variants.append(gv)
+
+    _add("vllm_decode_graph", '--compilation-config {"cudagraph_mode": "FULL_DECODE_ONLY"}')
+    _add("vllm_reserve_isl_off", "--no-scheduler-reserve-full-isl")
+    if conc > 0:
+        _add("vllm_max_seqs", f"--max-num-seqs {min(512, max(2 * conc, 64))}")
+    _add("vllm_batched_tokens_16k", "--max-num-batched-tokens 16384")
+    _add("vllm_prefix_cache_off", "--no-enable-prefix-caching")
+    return variants
+
+
 def _default_grid_for_framework(
     framework: str,
     *,
@@ -534,4 +561,9 @@ def _default_grid_for_framework(
         return _atom_default_grid(model_class=model_class, conc=conc)
     if fw == "xdit":
         return _xdit_default_grid()
+    if fw == "vllm":
+        from hyperloom_common.device_backend import is_ascend
+
+        if is_ascend():
+            return _vllm_ascend_default_grid(model_class=model_class, conc=conc)
     return []

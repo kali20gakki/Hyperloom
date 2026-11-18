@@ -1125,3 +1125,23 @@ def test_explore_refuses_a_round_whose_materialized_config_is_not_a_point(tmp_pa
         explore._round_point(cfg)
     assert refused.value.result["error_class"] == "unreadable_config"
     assert str(cfg) in refused.value.result["error"]
+
+
+def test_vllm_seeds_a_grid_on_an_ascend_host_only(monkeypatch):
+    """vLLM's explore needs a grid the model named; Ascend seeds one, AMD keeps the model's own."""
+    from hyperloom.orchestrator.actions.executors._grid_base import _default_grid_for_framework
+
+    monkeypatch.setenv("HYPERLOOM_DEVICE_BACKEND", "ascend")
+    ascend = _default_grid_for_framework("vllm", model_class="qwen3", conc=64)
+    assert [v.name for v in ascend] == [
+        "vllm_decode_graph",
+        "vllm_reserve_isl_off",
+        "vllm_max_seqs",
+        "vllm_batched_tokens_16k",
+        "vllm_prefix_cache_off",
+    ]
+    assert all(v.provenance == "default_grid" for v in ascend)
+    assert "--max-num-seqs 128" == ascend[2].extra_server_args
+
+    monkeypatch.setenv("HYPERLOOM_DEVICE_BACKEND", "amd")
+    assert _default_grid_for_framework("vllm", model_class="qwen3", conc=64) == []
