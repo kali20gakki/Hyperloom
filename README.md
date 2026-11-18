@@ -1,226 +1,163 @@
-# ROCm Hyperloom
+# Hyperloom 昇腾 NPU 适配版
 
-[![Tests](https://github.com/AMD-AGI/Hyperloom/actions/workflows/tests-coverage.yml/badge.svg)](https://github.com/AMD-AGI/Hyperloom/actions/workflows/tests-coverage.yml)
-[![Lint](https://github.com/AMD-AGI/Hyperloom/actions/workflows/lint.yml/badge.svg)](https://github.com/AMD-AGI/Hyperloom/actions/workflows/lint.yml)
-[![Version](https://img.shields.io/badge/version-1.1.5-blue)](https://github.com/AMD-AGI/Hyperloom/blob/main/pyproject.toml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/AMD-AGI/Hyperloom/blob/main/LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://github.com/AMD-AGI/Hyperloom/blob/main/pyproject.toml)
+> 本仓库是 [Hyperloom](https://github.com/AMD-AGI/Hyperloom) 的昇腾 NPU 适配分支。英文版说明见
+> [docs/ascend/README.md](docs/ascend/README.md)；上游项目原始 README 保留在
+> [README.upstream.md](README.upstream.md)。
 
-**ROCm™ Hyperloom** is a multi-agent harness that autonomously optimizes inference
-on AMD Instinct™ GPUs. It profiles each workload, searches framework and kernel
-optimizations, validates every candidate end to end, and carries proven results
-into a recipe knowledge base — without per-model human tuning.
+状态：**bring-up 阶段**。测量链路已经能在昇腾 NPU 上跑通；分析层、内核层与决策层部分接通。
+本文说明能跑什么、怎么跑、改了哪些地方，以及还缺什么。
 
-It supports text generation, image generation, and custom pipelines on vLLM,
-SGLang, and xDiT.
+## 1. 当前可运行的部分
 
-<p align="center"><img width="700" alt="Hyperloom architecture" src="https://raw.githubusercontent.com/AMD-AGI/Hyperloom/main/docs/images/Hyperloom_architecture.png" /></p>
+| 阶段 | 状态 | 说明 |
+|---|---|---|
+| 设备发现、占用门禁、轮次环境 | **可运行** | 经 `hyperloom_common.device_backend` 走 `npu-smi`；AMD 路径不变，由 `HYPERLOOM_DEVICE_BACKEND=amd` 选择 |
+| aarch64 上的工具 staging | **可运行** | `StagingProfile.INFERENCEX` 只铺 InferenceX 子集；钉死的 AgentX 客户端 CPython 是 x86_64 专用，自行拉起服务的轮次不再需要它 |
+| 单轮基准（`inference_suite run`） | **可运行** | 自己拉起 `vllm serve`（vLLM-Ascend）、压测、写 `report.json` |
+| 容量测量与形态对比（TP1 / TP2） | **可运行** | 见 §6 |
+| 读 trace 派生候选（TraceLens 路由） | **未接通** | TraceLens 是直接 import 的库且按 AMD 硬件建模；昇腾分析路由见 §8 |
+| Profile 采集 | **可运行** | vLLM-Ascend 自带的 `torch_npu.profiler` 封装，由 `--profiler-config` 与 `/start_profile`、`/stop_profile` 驱动 |
+| 算子优化 | **未接通** | `kernelforge` 没有昇腾内核后端；内核工作按委托方式接入（CANNBot 工作流） |
+| KEEP/REVERT 判定（`hyperloom optimize`） | **未端到端跑过** | 需要把 Orchestration/Critic 角色指向模型网关；它们依据的测量半边已可用 |
 
-## Merged upstream
+## 2. 方案
 
-Hyperloom found each of these in a real optimization session on AMD Instinct GPUs, and vLLM or
-SGLang merged it. The numbers are quoted from the linked PR and were measured on the upstream
-revision it names; the PR also carries the benchmark commands, the accuracy checks, and the
-operating points where the gain does not apply.
+Hyperloom 的控制面（相位链、动作目录、PolicyGate、会话状态、报告）本来与硬件无关。AMD 专属的部分集中在
+四个接缝上；本适配的做法是在每个接缝后面加一个实现，而不是在接缝内部写分支：
 
-| Upstream PR | Merged | Model / workload | GPU | Measured effect |
-|-------|------|-------|------|-------|
-| [sglang#41071](https://github.com/sgl-project/sglang/pull/41071) | 2026-10-10 | Qwen3-32B-FP8, 1024 in / 512 out, concurrency 4 | MI300X | +314 % output tok/s against the untuned Triton default; made the gfx942 default by sglang#43815 |
-| [sglang#43815](https://github.com/sgl-project/sglang/pull/43815) | 2026-10-27 | Qwen3-235B-A22B-Instruct-2507-FP8, 1024 in / 512 out, concurrency 4, TP=4 | MI325X | +118 % output tok/s, and +28 % at concurrency 128 |
-| [vllm#58539](https://github.com/vllm-project/vllm/pull/58539) | 2026-09-30 | DeepSeek-V4.1-Flash, 307 in / 23 out, TP=2 | MI355X | +53.9 % total tok/s, −37.0 % mean TTFT |
-| [sglang#45295](https://github.com/sgl-project/sglang/pull/45295) | 2026-10-29 | Gemma 3 12B it, 12288 in / 2048 out, concurrency 128 | MI325X | +14 % output tok/s, from more KV capacity for the full-attention layers |
-| [vllm#58897](https://github.com/vllm-project/vllm/pull/58897) | 2026-10-14 | gpt-oss-120b, 1033 in / 523 out, concurrency 61 | MI355X | +9.7 % total tok/s, −11.1 % median TPOT |
-| [sglang#46731](https://github.com/sgl-project/sglang/pull/46731) | 2026-10-29 | gemma-4-26B-A4B-it, 8192 in / 1024 out, concurrency 256 | MI355X | +9.0 % total tok/s, −15.9 % mean TTFT |
-| [sglang#46528](https://github.com/sgl-project/sglang/pull/46528) | 2026-10-27 | fp8-KV checkpoints with calibrated KV scales, such as Llama-3.1-8B-Instruct-FP8-KV | MI355X, MI325X | Correctness: the default aiter backend produced garbage with no flag set, GSM8K 0.000; now 0.760 |
-| [vllm#57108](https://github.com/vllm-project/vllm/pull/57108) | 2026-10-10 | Block-FP8 checkpoint missing a weight scale | MI300X, MI325X | Correctness: a checkpoint that had served garbage (GSM8K 0.00) now fails the load and names the parameter |
+1. **设备后端**——设备枚举、可见卡掩码、占用判定、遥测。`hyperloom_common.device_backend` 回答 `amd` 或
+   `ascend`，`hyperloom_common.ascend_smi` 读 `npu-smi`。
+2. **Staging 分档**——一轮需要哪些钉死的工具。自行拉起服务的轮次只读 InferenceX 子集，不需要 AgentX
+   客户端环境。
+3. **分析路由**——把 trace 拆成 breakdown 与内核候选。契约（`analysis.md`、`kernel_candidates.json`、
+   roofline 目标）不变，只换背后的产出者。
+4. **内核委托**——整条流水线或单算子优化。GEAK 没有 NPU 支持，因此昇腾会话走单算子/委托路线，而不是
+   GEAK 的 e2e 工作流。
 
-26 Hyperloom optimizations are merged upstream as of 2026-11-02, 12 for throughput and 14 for
-correctness; the eight with the largest measured effect are above.
-[Upstream optimizations merged into vLLM and SGLang](https://github.com/AMD-AGI/Hyperloom/blob/main/docs/upstream-results.md)
-has the full list, the per-row caveats, and the rule for what enters it.
+两个主机事实决定了改动的形状：
 
-## Why Hyperloom
+- 空闲的昇腾 NPU 会报出数 GiB 驱动预留 HBM，且不属于任何进程；集群监控还可能在每张卡上持有 122 MiB 的
+  context。因此占用判定沿用 AMD 规则：**进程的常驻内存超过 1 GiB**（或读不到内存）才算占用。
+- 轮次的服务端只继承 `config.server.env_inherit`，所以 `PYTHONPATH` 必须保留 CANN 的 `site-packages`
+  （`acl` 模块在那里），多卡运行必须设置 `HCCL_SOCKET_IFNAME`。
 
-Serving efficiency determines hardware capacity, latency, and operating cost.
-Tuning a workload across serving configuration, framework source, and GPU kernels
-has traditionally taken weeks from a scarce specialist pool, and that work
-repeats for every new model, framework release, and accelerator generation.
+## 3. 仓库改动
 
-Handing the same loop to an LLM is not enough. A real session runs for hundreds
-of turns, starts and stops many inference servers, and edits a serving
-framework's source tree. Left as the only source of truth, the model drifts from
-the original goal, rediscovers the same dead ends on every run, and can apply
-unsafe patches. Hyperloom is the harness around that loop: it keeps the mission
-grounded, reuses what earlier sessions already learned, and bounds what an agent
-is allowed to change.
+| 文件 | 改动 |
+|---|---|
+| `src/hyperloom_common/device_backend.py` | 新增：`amd` / `ascend` 选择，`HYPERLOOM_DEVICE_BACKEND` 覆盖 |
+| `src/hyperloom_common/ascend_smi.py` | 新增：解析 `npu-smi info`——卡、健康、功耗/温度/HBM、进程表 |
+| `src/inference_suite/runtime/gpus.py` | 轮次的设备门禁在昇腾上走 `npu-smi`；1 GiB 占用规则 |
+| `src/inference_suite/staging.py` | `StagingProfile`（`agentx` / `inferencex`）贯穿 `stage`、`verify`、`ensure_staged`；子集缓存会拒绝 AgentX 轮次 |
+| `src/inference_suite/cli.py` | `stage --profile {agentx,inferencex}` |
+| `src/inference_suite/run.py` | 轮次按自身负载类型对应的档位校验 |
+| `src/inference_suite/__init__.py` | 导出 `StagingProfile`、`profile_for` |
+| `src/inference_suite/tests/` | `conftest.py` 把套件里的 AMD 用例钉在 amd 后端；新增 `test_ascend_npu_gate.py`、`test_staging_profile.py` |
 
-## How it works
+AMD 行为不变：不设 `HYPERLOOM_DEVICE_BACKEND` 时，有 `rocm-smi`/`amd-smi` 的主机保持 AMD 路径，AMD 用例
+也自行钉住该后端。
 
-A session is a closed loop: **input → optimize → validate → learn**.
+## 4. 环境要求
 
-```text
-PRELUDE → ENABLEMENT → FRAMEWORK_AGENT → KERNEL_AGENT → SWEEP → CLOSE
-```
+- 昇腾 910B 级硬件（在 910B3、每卡 64 GiB HBM 上验证），CANN 9.x。
+- 与所配 vLLM 匹配的 vLLM-Ascend。本次 bring-up 使用 vLLM 0.30.0 + vllm-ascend 0.30.0 + torch 2.10.0 +
+  torch_npu 2.10.0.post7 + transformers 5.14.1，并 source 过 `ASCEND_HOME_PATH`。
+- Hyperloom 自身不需要 `torch`：`inference_suite` 跑在一个装有 PyYAML、`aiohttp`、`transformers` 的解释器
+  里（它自己运行压测客户端），并把 `server.framework_python` 指向 vLLM-Ascend 的解释器。
 
-After Sweep, the coordinator either closes or starts another cycle when budget
-remains, the run has not converged, and roofline analysis still shows headroom.
-A hard cycle ceiling prevents unbounded looping. A new cycle resumes at the
-framework layer from the established baseline, rather than starting over.
+### 环境补丁（仅 bring-up 用，不在仓库内）
 
-| Phase | What it does |
-|-------|----------------|
-| **Prelude** | Measures a stock baseline (the anchor for every later comparison), optionally replays the closest recipe from the knowledge base, then profiles and builds a roofline so later phases know where the headroom is. |
-| **Enablement** | Makes the model run at all (serving flags through targeted rebuilds), graded on runnability and accuracy. Only entered when a baseline fails; skipped on healthy runs. |
-| **Framework optimization** | Searches serving flags, precision, attention, batching, and ranked upstream diffs. |
-| **Kernel optimization** | Delegates hot kernels to one AMD backend — [GEAK](https://github.com/AMD-AGI/GEAK) or [KernelForge](https://github.com/AMD-AGI/Hyperloom/blob/main/docs/kernelforge/what-is-kernelforge.md) — then re-measures every accepted change end to end. Only one backend runs per phase. |
-| **Sweep** | Re-measures the accumulated stack across concurrency and sequence-length operating points. Skips itself when the validated gain has not moved. |
-| **Close** | Records why the run stopped, writes the recipe knowledge base, final report, and machine-readable session artifacts. |
+vllm-ascend 0.30.0 的 cp310 wheel 有三处本机无法直接运行的写法。以下都是 site-packages 补丁，刻意不进仓库；
+长期解法是 Python 3.12 环境与装有 `nnal/atb` 的主机。
 
-Benchmarks are run by the coordinator, not by the model. A gain an agent predicts
-is logged for calibration and never decides a keep. A kernel backend's claimed
-speedup is held as unverified until Hyperloom re-measures it under the session
-protocol. Changes that fail validation are reverted; successful changes become
-the new baseline.
+- `patch_indexer_kv_dtype.py` / `patch_kv_cache_dtype.py` 里的 `typing.Literal[*args]`（3.11+ 语法）→ 改为
+  传元组，适配 Python 3.10。
+- 模型补丁会主动 import `fla_npu`（GDN/KDA 算子，本机没有）→ 打桩，被调用时报错。
+- 没有 `nnal/atb` 时缺 `libatb.so` → ATB 注册与预热改为记录日志并跳过。
+- Profiler 导出 `[Text, Db]`，便于基于 DB 的分析工具读取采集结果。
 
-See the [optimization loop](https://github.com/AMD-AGI/Hyperloom/blob/main/docs/conceptual/optimization-loop.md) for the runtime
-contracts, enablement ladder, and phase allowlists.
-
-### Multi-agent harness
-
-The Coordinator runs Orchestration and Critic turns and dispatches specialists
-when needed. Each turn is grounded in persisted session state rather than an
-automatic supervision or recovery loop:
-
-| Role | When it runs | How it keeps the run on-goal |
-|------|----------------|------------------------------|
-| **Orchestration** | Every tick; in KERNEL_AGENT only when kernel progress changes, or after 15 minutes without a turn | Continuous planner; mission and progress are re-seeded from the state file, not from the transcript |
-| **Critic** | Every keep-or-revert | Rules on whether a change served the mission; the learning record is written from that verdict |
-| **Specialist** | Authoring only | Ephemeral. Returns a reviewed diff, not a decision |
-
-Risky source edits go through an isolated worktree, a unified-diff gate, a
-policy check, a Critic sign-off, and a coordinator benchmark. A rejection names
-the rule it broke so the next attempt is a fix, not a repeat.
-
-### Recipe knowledge base
-
-Every session reads the recipe knowledge base (Recipe KB) before it starts and
-writes back when it finishes. A row stores the winning configuration, measured
-throughput, useful lessons, and failures worth remembering. Lookup relaxes one
-field at a time (model, hardware, framework, model type, architecture, framework
-version, precision) so a close match can warm-start the next run. Past failures
-are evidence in prompt context, not hard disqualifiers; what *enters* the KB is
-strict, because a bad entry outlives the run that created it.
-
-Profiling and bottleneck analysis are backed by
-[TraceLens](https://github.com/AMD-AGI/TraceLens), with traces collected by the
-profile rounds of [InferenceSuite](docs/reference/inference-suite.md), the in-tree
-package that runs every benchmark round. Long-horizon search and
-the knowledge base are described further in
-[Arbor](https://arxiv.org/abs/2606.12563).
-
-## Supported features
-
-| Feature | Options |
-|------|-------|
-| Workload | Text generation, image generation, and custom / scriptable pipelines |
-| Platform | MI300X, MI325X, MI355X |
-| Framework | SGLang, vLLM, xDiT |
-| Kernel language | HIP, Triton, FlyDSL |
-| Kernel backends | GEAK, KernelForge |
-| LLM backend | Claude, Codex |
-
-## Get started
-
-| Goal | Guide |
-|------|-------|
-| Set up Hyperloom and run a demo | [Quickstart](https://github.com/AMD-AGI/Hyperloom/blob/main/examples/README.md) |
-| Launch and monitor an optimization | [Run an optimization](https://github.com/AMD-AGI/Hyperloom/blob/main/docs/how-to/optimize.md) |
-| Understand the algorithm | [Optimization loop](https://github.com/AMD-AGI/Hyperloom/blob/main/docs/conceptual/optimization-loop.md) |
+## 5. 使用方式
 
 ```bash
-python -m hyperloom optimize
+export HYPERLOOM_DEVICE_BACKEND=ascend
+export ASCEND_RT_VISIBLE_DEVICES=0
+source "$ASCEND_HOME_PATH/set_env.sh"
+
+# 1. 铺设一轮要读的工具。NPU 主机上铺子集档。
+python -m inference_suite stage --tool-cache /path/to/tools --profile inferencex
+
+# 2. 描述一次启动。该文件只被读取、不会被执行：轮次自己拉起服务。
+cat > serve.sh <<'SH'
+export ASCEND_RT_VISIBLE_DEVICES=0
+vllm serve /models/Qwen3-8B --tensor-parallel-size 1 --max-model-len 4096 --dtype bfloat16
+SH
+python -m inference_suite resolve --query query.json --gpus 1 \
+    --out base_launch.json --user-file serve.sh
+
+# 3. 跑一轮并读 report.json。
+python -m inference_suite run --config config.yaml --run-dir runs/base-1
 ```
 
-## Documentation
+`query.json` 是 `LaunchQuery` 文档（`model_id`、`framework`、`board`、`workload: fixed`、`concurrencies`、
+`tp`、`isl`、`osl`）。`config.yaml` 是 `inference-suite-config/1` 文档；昇腾上值得设置的是
+`server.framework_python`（vLLM-Ascend 解释器）、`server.gpus`、`paths.tool_cache` 与
+`paths.tool_manifest_sha256`（`stage` 打印）、`telemetry.gpu.enabled: false`（没有 `amd-smi`），以及
+`server.env.inherit`——必须包含 `ASCEND_HOME_PATH`、`ASCEND_TOOLKIT_HOME`、`LD_LIBRARY_PATH`、`PATH`、
+`PYTHONPATH` 和 `ASCEND_RT_VISIBLE_DEVICES`。
 
-| Topic | Link |
-|-------|------|
-| ROCm Docs | [Hyperloom](https://rocm.docs.amd.com/projects/hyperloom/en/latest/index.html) |
-| Authentication and credentials | [Authentication & credentials](https://github.com/AMD-AGI/Hyperloom/blob/main/docs/reference/authentication.md) |
-| Environment variables | [Environment variables](https://github.com/AMD-AGI/Hyperloom/blob/main/docs/reference/environment-variables.md) |
-| Components | [Components](https://github.com/AMD-AGI/Hyperloom/blob/main/docs/components/index.md) |
-| Compatibility | [Compatibility matrix](https://github.com/AMD-AGI/Hyperloom/blob/main/docs/compatibility.rst) |
-| Troubleshooting | [Troubleshooting](https://github.com/AMD-AGI/Hyperloom/blob/main/docs/reference/troubleshooting.md) |
-| Operations | [Operations & self-hosting](https://github.com/AMD-AGI/Hyperloom/blob/main/docs/reference/operations.md) |
-| Session output schema | [`session_breakdown.json`](https://github.com/AMD-AGI/Hyperloom/blob/main/docs/reference/session-breakdown.md) |
+### 多卡（TP2）
 
-## File issues and feedback
+```bash
+# serve-tp2.sh
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export HCCL_SOCKET_IFNAME=<承载 HCCL 的网卡>   # 不设会 hcclGetRootInfo 失败（error 19）
+vllm serve /models/Qwen3-8B --tensor-parallel-size 2 --max-model-len 4096 \
+    --dtype bfloat16 --gpu-memory-utilization 0.75   # TP2 下 0.85 会在 sampler 处 OOM
+```
 
-If you encounter problems or bugs while running Hyperloom, open an
-[issue](https://github.com/AMD-AGI/Hyperloom/issues/new/choose), or send
-feedback through the
-[beta survey](https://www.feedback.amd.com/se/5A1E27D2004A9E15).
+然后用 `--gpus 2` 和一个 `tp` 为 `2` 的 `LaunchQuery` 做 resolve。
 
----
+## 6. 实测结果
 
-## Developer entry points
+Qwen3-8B，ISL/OSL 1024，并发 64，128 请求，单节点，prefix cache 保持启动脚本的原样。由
+`inference_suite run` 自身测得：
 
-- Runtime package: `src/hyperloom/`
-- Contributor & AI authoring contract: [`AGENTS.md`](https://github.com/AMD-AGI/Hyperloom/blob/main/AGENTS.md)
-- Main agent instructions: [`src/hyperloom/inference_optimizer/SKILL.md`](https://github.com/AMD-AGI/Hyperloom/blob/main/src/hyperloom/inference_optimizer/SKILL.md)
-- CLI entry point: `hyperloom <command>` (or `python -m hyperloom <command>`)
-- Operator tools: `python -m hyperloom session <breakdown|report|backfill|events|state>`
-- Compute-partition sweep: `python3 scripts/partition_mode_sweep.py` — sets each
-  AMD partition mode (`SPX`/`DPX`/`QPX`/`CPX`) on one card in turn, runs the same
-  benchmark on every partition that mode creates, sums the throughput and restores
-  the entry mode. Answers which shape a workload wants before a session commits to
-  one; `optimize` itself only ever reads the mode. Needs privilege for the set, so
-  it is a script rather than part of the loop.
-- Platform tuning audit: `python3 scripts/platform_audit.py` — checks the host CPU
-  tuning that silently changes benchmark results. Judges Core Performance Boost and
-  the cpufreq governor against [AMD's BIOS & Workload Tuning Guide for EPYC 9004][58011];
-  records determinism, SMT and NPS without a verdict, because chapter 5 varies those
-  by workload or the OS layer can only infer them. Reads `/sys`, `/proc` and — as
-  root — the HWCR MSR; no credentials, nothing written. Exit `0` on target, `1` a
-  knob is wrong, `2` unresolved, which CI should treat as missing coverage rather
-  than as a failure. The BIOS-only knobs are not reachable this way; see below.
-- BIOS audit over the BMC: `sudo python3 scripts/platform_audit_bmc.py --bmc-user <ro>`
-  — covers the three knobs the OS cannot see (High Performance profile, APBDIS, DF
-  C-states), targeted per [58011][58011] §4.2.1, §4.4.3 and §4.4.4. Without
-  `--bmc-user` it refuses to run unless `--allow-account-creation` is passed, because
-  that path **mints a temporary ADMINISTRATOR account on the BMC**; exit `3` means
-  such an account was left enabled or could not be confirmed revoked, and should page
-  someone. The script's docstring has the account lifecycle and the rest of the exit
-  codes.
-- Documentation source: `docs/`
+| 形态 | 输出吞吐 | 平均 TTFT | 平均 TPOT | 完成情况 |
+|---|---|---|---|---|
+| TP1，单卡 | 1521.5 tok/s | 1733 ms | 40.20 ms | 128/128，0 失败 |
+| TP2，双卡 | 2044.6 tok/s | 1756 ms | 29.45 ms | 128/128，0 失败 |
 
-[58011]: https://docs.amd.com/v/u/en-US/58011-epyc-9004-tg-bios-and-workload
+TP2 相对 TP1：**输出吞吐 +34.4%，TPOT −26.7%，TTFT +1.3%**。TP1 形态在丢弃一轮预热后，用压测客户端连跑
+的重复性为 ±0.1%；上表每个形态各跑了一轮。
 
-For contribution workflow, testing, and linting, see
-[`CONTRIBUTING.md`](https://github.com/AMD-AGI/Hyperloom/blob/main/CONTRIBUTING.md).
+对 TP1 形态抓的 `torch_npu` profile 解释了天花板：decode 的
+GEMM（`aclnnMatmul_MatMulV2`）占设备时间 79%，平均 `aic_mac_ratio` 仅 0.16——Cube 空闲，瓶颈是从 HBM 流
+动权重；prefill GEMM 能到 0.86。不改变“每 token 搬运字节数”的框架旋钮都没有效果：调度器的 reserve-ISL
+开关是中性（1434.5 → 1434.6 tok/s），`TASK_QUEUE_ENABLE=2` 在图捕获下被拒绝。有效的杠杆是摊薄或缩小权重
+流——张量并行（见上）与权重量化（尚未跑）。
 
----
+## 7. 已知限制
 
-## Licensing
+- 尚无昇腾分析路由：`trace_analyze` 仍进入 TraceLens，而它是 AMD 形状的。
+- `hyperloom optimize` 未端到端跑过：Orchestration/Critic 角色需要模型网关，围绕已可用的测量链路的
+  KEEP/REVERT 判定尚未在 NPU 上验证。
+- 没有内核后端：`kernelforge` 不支持 Ascend C 或 Triton-Ascend，GEAK 也没有 NPU 路径。
+- 没有量化集成（msModelSlim），没有多机（单节点之外的 HCCL/拓扑）。
+- AgentX 客户端环境是 x86_64 专用（`pins.AGENTX_PYTHON_BUILD`、`client_env.LOCK_PLATFORMS`），因此
+  AgentX 与 MLPerf 负载无法在 aarch64 主机上 staging。
+- CI 不覆盖这些内容：没有 NPU runner。
 
-Hyperloom is released under the **MIT License**. The full license text
-is in [`LICENSE`](https://github.com/AMD-AGI/Hyperloom/blob/main/LICENSE).
+## 8. 下一步任务
 
-You may use Hyperloom commercially, modify it, and distribute it under
-the terms of the MIT license, provided the copyright notice and the
-permission notice are retained in all copies or substantial portions of
-the software.
-
-Third-party tools and agents (Cursor, Visual Studio, Claude Code, and Codex)
-that Hyperloom invokes are governed by their own separate license terms
-and are NOT covered by the MIT license above — see the "Third-Party
-Tools and Agents" section in [`LICENSE`](https://github.com/AMD-AGI/Hyperloom/blob/main/LICENSE). You are responsible
-for reviewing and complying with each tool's individual license.
-
-A few files distributed *inside* Hyperloom are also third-party — reference
-kernels and a Triton oracle carried in forge's knowledge base and examples.
-They keep their own licences; [`THIRD_PARTY.md`](https://github.com/AMD-AGI/Hyperloom/blob/main/THIRD_PARTY.md) lists them and
-`REUSE.toml` carries the machine-readable form.
-
-For security-relevant issues, see [`SECURITY.md`](https://github.com/AMD-AGI/Hyperloom/blob/main/SECURITY.md). For
-contribution conventions, see [`CONTRIBUTING.md`](https://github.com/AMD-AGI/Hyperloom/blob/main/CONTRIBUTING.md).
+1. **昇腾分析路由**——消费 `torch_npu` 采集产物（Text + Db），产出既有契约（`analysis.md`、
+   `kernel_candidates.json`、基于公开芯片峰值与 `aic_*` 流水线占比的 roofline）。验收：对一份 Qwen3-8B
+   采集给出 `analysis.md` 与候选清单，且 top 内核排名与人工排序一致。
+2. **闭合决策环**——把 agent 角色指向网关，在 NPU 上跑 `hyperloom optimize`，让一次 TP2 启动按正常的
+   阈值/噪声带被接受为 KEEP。验收：一次会话包含基线、一个被 KEEP 的候选、以及最终报告。
+3. **量化**——msModelSlim W8A8 权重经 vLLM-Ascend 起服，并由精度评测把门。验收：精度在阈值内的可测量
+   吞吐收益。
+4. **内核委托**——把热点算子交给 CANNBot 的 Triton-Ascend / Ascend C 工作流，集成结果并做端到端测量。
+   验收：单个算子有可测加速且精度不变。
+5. **aarch64 上的 AgentX**——补 aarch64 解释器 pin 与配套客户端 lock，使 `agentx`/`mlperf` 负载能在 arm
+   主机上 staging。
+6. **CI**——把 `npu-smi` 解析与 staging 分档的夹具测试放进默认选择，并加一个带标记的 NPU runner 集成任务。

@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 name = "hyperloom-inference_optimizer"
 version = "1.1.5"
 description = "Inference Optimizer — two-role (Orchestration/Critic) autonomous LLM inference optimization runtime for AMD GPU platforms. Kernel optimization is handled by programmatic Python handlers."
-readme = "README.md"
+readme = "README.upstream.md"
 requires-python = ">=3.10"
 # PEP 639 SPDX expression. The former ``{ text = "MIT" }`` table is deprecated
 # by setuptools and slated to become a hard error on 2027-Feb-18.

@@ -1,5 +1,7 @@
 # Hyperloom on Ascend NPU
 
+> 中文版（仓库首页）：[README.md](../../README.md)
+
 Status: **bring-up spike**. The measurement path runs on Ascend NPUs today; the analysis, kernel and
 decision layers are partly wired. This document states what runs, how to run it, what changed in the tree, and
 what is still missing.
