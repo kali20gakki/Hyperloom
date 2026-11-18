@@ -138,6 +138,18 @@ the `hot_kernels` / `routable_kernels` / `skipped_kernels` / `task_groups` shape
 `trace_analyze` with `analysis_route=msagent` enters the same module, so the coordinator path and the direct command
 share one implementation.
 
+### Profile capture
+
+A profile round on an Ascend host writes `*_ascend_pt/ASCEND_PROFILER_OUTPUT` under the round's trace directory;
+the executor records that directory as the round's trace (`capture_format: ascend_pt`) and a `trace_analyze` that
+names no route goes to the msagent one. The default capture window is computed for a much longer AMD run, so the
+profiler never starts inside a short NPU round; bound it:
+
+```bash
+export HYPERLOOM_PROFILE_MAX_ITERS=64    # capture steps; setting it also resets the delay default to 8
+export HYPERLOOM_PROFILE_DELAY_ITERS=1   # steps to skip before capturing
+```
+
 ### Decision loop
 
 ```bash

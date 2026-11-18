@@ -134,6 +134,17 @@ python -m hyperloom.orchestrator.trace_analysis.msagent_analysis \
 `hot_kernels` / `routable_kernels` / `skipped_kernels` / `task_groups` 结构）。`trace_analyze` 请求带
 `analysis_route=msagent` 时进入同一模块，命令行与协调器路径共用一份实现。
 
+### Profile 采集
+
+昇腾上的 profile 轮次会写出 `*_ascend_pt/ASCEND_PROFILER_OUTPUT`，执行器把它记为这一轮的 trace
+（`capture_format: ascend_pt`），未指定路由的 `trace_analyze` 会走 msagent 路由。默认采集窗口是按 AMD 的
+长跑算的，短轮次里 profiler 根本不会启动，需要手动收窄：
+
+```bash
+export HYPERLOOM_PROFILE_MAX_ITERS=64    # 采集步数；设了它延时默认回到 8
+export HYPERLOOM_PROFILE_DELAY_ITERS=1   # 采集前跳过的步数
+```
+
 ### 决策环
 
 ```bash
