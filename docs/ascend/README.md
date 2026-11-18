@@ -17,7 +17,7 @@ what is still missing.
 | Reading a trace and deriving candidates | **works on Ascend** | `analysis_route=msagent`: a model reads the `torch_npu` capture through msprof-mcp under the msAgent profiler skills. TraceLens stays the AMD route |
 | Profile capture | **works** | vLLM-Ascend's own `torch_npu.profiler` wrapper, driven by `--profiler-config` and `/start_profile`/`/stop_profile` |
 | Kernel optimization | **not wired** | no Ascend kernel backend in `kernelforge`; kernel work is meant to be delegated (CANNBot workflows) |
-| KEEP/REVERT decisions (`hyperloom optimize`) | **boots and measures** | the Coordinator runs on a gateway model, resolves the base and measures the baseline on the card; the accuracy gate and the first KEEP are the open items |
+| KEEP/REVERT decisions (`hyperloom optimize`) | **runs end to end; no KEEP yet** | the Coordinator runs on a gateway model, measures the baseline on the card (1509 tok/s) and closes the session; the budget it had left could not fit an `explore` round |
 
 ## 2. Approach
 
@@ -155,9 +155,10 @@ python -m hyperloom optimize --framework vllm --gpu-type 910b3 --model <model pa
 ```
 
 The orchestration and critic roles run on the gateway model (`INFERENCE_OPTIMIZER_AGENT_BACKEND=codex`,
-`CODEX_MODEL=<model>`). The run resolves the reference launch, boots the vLLM-Ascend server and measures the baseline
-round on the card. The accuracy gate that follows it, and the first KEEP from an `explore` round, are the remaining
-work in §8.
+`CODEX_MODEL=<model>`). The run resolves the reference launch, boots the vLLM-Ascend server, measures the baseline
+round, passes its accuracy gate and closes. A baseline of one card costs 15–20 minutes (model load, one warmup plus
+measured round, and the eval), so a session that is also to try candidates needs a budget well above that — the
+0.4 h run here closed with `time_exhausted` at a measured baseline of 1509 tok/s and no `explore` round.
 
 ## 6. Measured results
 

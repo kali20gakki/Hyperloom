@@ -18,7 +18,7 @@
 | 读 trace 派生候选 | **昇腾上可运行** | `analysis_route=msagent`：模型通过 msprof-mcp 与 msAgent profiler 技能读 `torch_npu` 采集；TraceLens 仍是 AMD 路由 |
 | Profile 采集 | **可运行** | vLLM-Ascend 自带的 `torch_npu.profiler` 封装，由 `--profiler-config` 与 `/start_profile`、`/stop_profile` 驱动 |
 | 算子优化 | **未接通** | `kernelforge` 没有昇腾内核后端；内核工作按委托方式接入（CANNBot 工作流） |
-| KEEP/REVERT 判定（`hyperloom optimize`） | **已能起到测量基线** | Coordinator 跑在网关模型上，解析 base 并在卡上测出基线；精度门与首个 KEEP 仍未打通 |
+| KEEP/REVERT 判定（`hyperloom optimize`） | **端到端跑通；尚无 KEEP** | Coordinator 跑在网关模型上，测出基线（1509 tok/s）并正常收尾；预算不足未能挤进一轮 `explore` |
 
 ## 2. 方案
 
@@ -151,8 +151,9 @@ python -m hyperloom optimize --framework vllm --gpu-type 910b3 --model <模型�
 ```
 
 编排与评审角色跑在网关模型上（`INFERENCE_OPTIMIZER_AGENT_BACKEND=codex`、`CODEX_MODEL=<模型>`）。运行会解析
-参考启动脚本、拉起 vLLM-Ascend 服务并在卡上测出基线轮；随后的精度门与第一个 `explore` KEEP 属于 §8 的剩余
-工作。
+参考启动脚本、拉起 vLLM-Ascend 服务、测出基线轮并通过精度门，然后正常收尾。单卡基线一次要 15–20 分钟
+（加载模型、预热轮 + 测量轮、精度评测），所以还要试候选的会话预算必须远高于此——这里 0.4 h 的那次以
+`time_exhausted` 收尾，基线 1509 tok/s，没轮到 `explore`。
 
 ## 6. 实测结果
 
