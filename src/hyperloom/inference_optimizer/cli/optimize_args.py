@@ -11,6 +11,8 @@ from hyperloom.common import predictor_config
 from hyperloom.common.workload_defaults import DEFAULT_PRECISION
 from hyperloom_common.gpu_identity import AMD_GPU_BOARDS
 
+from hyperloom.inference_optimizer.gpu_types import ASCEND_NPU_BOARDS
+
 from .. import framework_registry
 from .backends import CRITIC_PROTOCOL_CHOICES
 from .benchmark_config import add_benchmark_argument
@@ -23,7 +25,7 @@ def add_gpu_partition_arguments(opt: argparse.ArgumentParser) -> None:
         type=str.lower,
         # Sorted for a stable --help listing, and derived so a board added to the board table is accepted here
         # without a second edit.
-        choices=sorted(AMD_GPU_BOARDS),
+        choices=sorted({*AMD_GPU_BOARDS, *ASCEND_NPU_BOARDS}),
         default=None,
         help="Hint for the real target GPU. The rocm-smi probe always "
         "wins when both are present and disagree; a WARN is "

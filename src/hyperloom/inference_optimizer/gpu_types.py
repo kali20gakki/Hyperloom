@@ -28,6 +28,19 @@ class BoardPolicy:
 
 _VLLM_ONLY = frozenset({"vllm"})
 
+#: Ascend NPU boards the CLI accepts and the NPU probe names, keyed as the board prints itself.
+ASCEND_NPU_BOARDS: dict[str, str] = {
+    "910b1": "Ascend 910B1",
+    "910b2": "Ascend 910B2",
+    "910b3": "Ascend 910B3",
+    "910b4": "Ascend 910B4",
+}
+
+#: Ascend boards carry one policy: vLLM only, and no targeted build or GEAK identity to pin.
+_ASCEND_BOARD_POLICIES: dict[str, BoardPolicy] = {
+    board: BoardPolicy(validated_frameworks=_VLLM_ONLY, targeted_build_validated=False) for board in ASCEND_NPU_BOARDS
+}
+
 #: Keyed by ``AMD_GPU_BOARDS``: every board has exactly one policy row.
 _BOARD_POLICIES: dict[str, BoardPolicy] = {
     "mi300x": BoardPolicy(names_its_arch=True),
@@ -51,7 +64,14 @@ _GFX_REFERENCE_BOARDS: dict[str, str] = {
 
 
 def _board_policy(gpu_type: str | None) -> BoardPolicy | None:
-    return _BOARD_POLICIES.get(str(gpu_type or "").strip().lower())
+    key = str(gpu_type or "").strip().lower()
+    return _BOARD_POLICIES.get(key) or _ASCEND_BOARD_POLICIES.get(key)
+
+
+def ascend_board_for(text: str | None) -> str | None:
+    """The Ascend board a ``npu-smi`` product name (``910B3``) or board name stands for, or ``None``."""
+    compact = str(text or "").lower().replace("ascend", "").replace(" ", "")
+    return next((board for board in ASCEND_NPU_BOARDS if board in compact), None)
 
 
 def targeted_build_validated(gpu_type: str) -> bool:
@@ -78,7 +98,9 @@ def reference_gpu_type_for_gfx(text: str | None) -> str | None:
 def parse_gpu_type(text: str | None) -> str | None:
     """Map rocm-smi / gcnArchName output, possibly mixed into other log text, to a supported board name."""
     board = board_named_in(text)
-    return board.product if board else reference_gpu_type_for_gfx(text)
+    if board:
+        return board.product
+    return reference_gpu_type_for_gfx(text) or ascend_board_for(text)
 
 
 def _board_framework_error(gpu_type: str, framework: str) -> str | None:
@@ -123,6 +145,9 @@ def _autodetect_gpu_type() -> str | None:
     """Return a canonical supported board name, or ``None`` if undetectable."""
     import subprocess
 
+    probe = _autodetect_npu_type()
+    if probe is not None:
+        return probe
     try:
         out = subprocess.run(
             ["rocm-smi", "--showproductname"],
@@ -145,16 +170,35 @@ def _autodetect_gpu_type() -> str | None:
         return None
 
 
+def _autodetect_npu_type() -> str | None:
+    """The Ascend board this host's NPUs report, read through ``npu-smi``; ``None`` on a host without it."""
+    from hyperloom_common.device_backend import is_ascend
+
+    if not is_ascend():
+        return None
+    from hyperloom_common.ascend_smi import NpuSmiError, npu_readings
+
+    try:
+        readings = npu_readings()
+    except NpuSmiError:
+        return None
+    return ascend_board_for(readings[0].name) if readings else None
+
+
+def _supported_board(name: str) -> bool:
+    return name in AMD_GPU_BOARDS or name in ASCEND_NPU_BOARDS
+
+
 def _resolve_amd_gpu_type(explicit: str | None = None) -> str | None:
     """Resolve the current AMD GPU type, or None when not on AMD/unknown."""
     explicit_norm = str(explicit or "").strip().lower()
     if explicit_norm:
-        return explicit_norm if explicit_norm in AMD_GPU_BOARDS else None
+        return explicit_norm if _supported_board(explicit_norm) else None
     env_norm = (os.environ.get("TARGET_GPU_TYPE", "") or os.environ.get("GPU_TYPE", "")).strip().lower()
     if env_norm:
-        return env_norm if env_norm in AMD_GPU_BOARDS else None
+        return env_norm if _supported_board(env_norm) else None
     detected = (_autodetect_gpu_type() or "").strip().lower()
-    return detected if detected in AMD_GPU_BOARDS else None
+    return detected if _supported_board(detected) else None
 
 
 def amd_gpu_board(gpu_type: str | None = None) -> GpuBoard | None:

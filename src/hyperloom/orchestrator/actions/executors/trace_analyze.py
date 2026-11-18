@@ -619,6 +619,32 @@ def _invalid_route_result(requested_route: str) -> dict[str, Any]:
     }
 
 
+async def _run_msagent_analysis(
+    payload: dict, trace_input: Any, workspace_path: str, framework: str, session_dir: Path
+) -> HandlerResult:
+    """Run the Ascend route: one agent turn over the capture, its artifacts surfaced like TraceLens's."""
+    out_dir = Path(workspace_path) / "msagent_analysis"
+    timeout_sec = int(payload.get("budget_minutes", 60)) * 60
+    cmd = [
+        sys.executable,
+        "-m",
+        "hyperloom.orchestrator.trace_analysis.msagent_analysis",
+        "--trace-dir",
+        str(trace_input),
+        "--out",
+        str(out_dir),
+        "--framework",
+        framework,
+        "--timeout-sec",
+        str(timeout_sec),
+    ]
+    result = await _run_analysis_tool(cmd, timeout_sec)
+    if result.get("status") == "ok":
+        _surface_artifact_paths(result)
+        result["trace_health_warnings"] = []
+    return result
+
+
 async def _run_analysis_tool(cmd: list[str], timeout_sec: int) -> dict[str, Any]:
     """Run the analysis tool and shape its result; a timeout becomes a failed result."""
     try:
@@ -701,6 +727,12 @@ async def trace_analyze_handler(
         analysis_route = AnalysisRoute(requested_route) if requested_route else AnalysisRoute.AGENT
     except ValueError:
         return _invalid_route_result(requested_route)
+    workspace_path = payload.get("workspace_path") or str(session_dir)
+    Path(workspace_path).mkdir(parents=True, exist_ok=True)
+    if analysis_route is AnalysisRoute.MSAGENT:
+        # An Ascend capture is read under a model through msprof-mcp; TraceLens never enters this route.
+        return await _run_msagent_analysis(payload, trace_input, workspace_path, framework, session_dir)
+
     tracelens_root = paths.tracelens_root()
     # Self-heal when the checkout is missing or incomplete (no .git).
     if not (tracelens_root / ".git").exists():
@@ -708,10 +740,6 @@ async def trace_analyze_handler(
     tl_err = _tracelens_root_error(tracelens_root)
     if tl_err:
         return {"status": "failed", "error_class": "tracelens_root_missing", "error": tl_err}
-
-    # Pass the session root so artefacts settle under ``<session_dir>/kernel-agent/runs/...``.
-    workspace_path = payload.get("workspace_path") or str(session_dir)
-    Path(workspace_path).mkdir(parents=True, exist_ok=True)
 
     # Scriptable frameworks (xDiT) have no decode steady-state window, so feed the
     # raw trace and drop the --split-* hints.

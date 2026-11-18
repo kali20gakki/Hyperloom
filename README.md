@@ -15,10 +15,10 @@
 | aarch64 上的工具 staging | **可运行** | `StagingProfile.INFERENCEX` 只铺 InferenceX 子集；钉死的 AgentX 客户端 CPython 是 x86_64 专用，自行拉起服务的轮次不再需要它 |
 | 单轮基准（`inference_suite run`） | **可运行** | 自己拉起 `vllm serve`（vLLM-Ascend）、压测、写 `report.json` |
 | 容量测量与形态对比（TP1 / TP2） | **可运行** | 见 §6 |
-| 读 trace 派生候选（TraceLens 路由） | **未接通** | TraceLens 是直接 import 的库且按 AMD 硬件建模；昇腾分析路由见 §8 |
+| 读 trace 派生候选 | **昇腾上可运行** | `analysis_route=msagent`：模型通过 msprof-mcp 与 msAgent profiler 技能读 `torch_npu` 采集；TraceLens 仍是 AMD 路由 |
 | Profile 采集 | **可运行** | vLLM-Ascend 自带的 `torch_npu.profiler` 封装，由 `--profiler-config` 与 `/start_profile`、`/stop_profile` 驱动 |
 | 算子优化 | **未接通** | `kernelforge` 没有昇腾内核后端；内核工作按委托方式接入（CANNBot 工作流） |
-| KEEP/REVERT 判定（`hyperloom optimize`） | **未端到端跑过** | 需要把 Orchestration/Critic 角色指向模型网关；它们依据的测量半边已可用 |
+| KEEP/REVERT 判定（`hyperloom optimize`） | **已能起到测量基线** | Coordinator 跑在网关模型上，解析 base 并在卡上测出基线；精度门与首个 KEEP 仍未打通 |
 
 ## 2. 方案
 
@@ -117,6 +117,43 @@ vllm serve /models/Qwen3-8B --tensor-parallel-size 2 --max-model-len 4096 \
 
 然后用 `--gpus 2` 和一个 `tp` 为 `2` 的 `LaunchQuery` 做 resolve。
 
+### 昇腾分析路由
+
+一次昇腾采集由模型通过 `msprof-mcp` 与 msAgent profiler 技能来读：
+
+```bash
+export HYPERLOOM_MSAGENT_SKILLS=/path/to/msagent/skills/profiler
+export HYPERLOOM_MSPROF_MCP=/path/to/mcp-venv/bin/msprof-mcp   # 一个装了 mcp<2 的解释器
+export OPENAI_BASE_URL=... OPENAI_API_KEY=... CODEX_MODEL=<模型>
+python -m hyperloom.orchestrator.trace_analysis.msagent_analysis \
+    --trace-dir <轮次 trace 目录> --out <分析输出目录> --framework vllm
+```
+
+它会找到 `ASCEND_PROFILER_OUTPUT`，对数据库与 CSV 跑一轮 agent，按契约校验模型写出的 JSON，并发布
+`analysis.md` 与 `kernel_candidates.json`（后者是编排器读的
+`hot_kernels` / `routable_kernels` / `skipped_kernels` / `task_groups` 结构）。`trace_analyze` 请求带
+`analysis_route=msagent` 时进入同一模块，命令行与协调器路径共用一份实现。
+
+### 决策环
+
+```bash
+export HYPERLOOM_DEVICE_BACKEND=ascend
+export HYPERLOOM_SKIP_FRAMEWORK_CHECK=1          # 预检里的"是不是 ROCm 构建"探针
+export KERNEL_AGENT_ENV=<文件>                    # install.sh 本来会写的 kernel-agent env
+export HYPERLOOM_CODEX_SANDBOX_MODE=bypass       # 本机没有可用的 bubblewrap
+export INFERENCE_SUITE_TOOL_CACHE=<已铺设的缓存>
+export INFERENCE_OPTIMIZER_RAY_EXEC=0            # Ray 在 NPU 主机上看不到 GPU
+export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1   # 带 "[::1]" 的条目会让 httpx 解析失败
+
+python -m hyperloom optimize --framework vllm --gpu-type 910b3 --model <模型路径> \
+    --reference-script serve.sh --tp 1 --conc 64 --isl 1024 --osl 1024 \
+    --max-hours 0.3 --no-kernel --no-enable-roofline --enablement off
+```
+
+编排与评审角色跑在网关模型上（`INFERENCE_OPTIMIZER_AGENT_BACKEND=codex`、`CODEX_MODEL=<模型>`）。运行会解析
+参考启动脚本、拉起 vLLM-Ascend 服务并在卡上测出基线轮；随后的精度门与第一个 `explore` KEEP 属于 §8 的剩余
+工作。
+
 ## 6. 实测结果
 
 Qwen3-8B，ISL/OSL 1024，并发 64，128 请求，单节点，prefix cache 保持启动脚本的原样。由
@@ -138,9 +175,9 @@ GEMM（`aclnnMatmul_MatMulV2`）占设备时间 79%，平均 `aic_mac_ratio` 仅
 
 ## 7. 已知限制
 
-- 尚无昇腾分析路由：`trace_analyze` 仍进入 TraceLens，而它是 AMD 形状的。
-- `hyperloom optimize` 未端到端跑过：Orchestration/Critic 角色需要模型网关，围绕已可用的测量链路的
-  KEEP/REVERT 判定尚未在 NPU 上验证。
+- 昇腾分析路由需要 agent CLI、模型网关，以及一个装了 `mcp<2` 的解释器来跑 msprof-mcp；这些都不在默认安装里。
+- `hyperloom optimize` 在 NPU 上能起到基线轮，但还没有 KEEP：精度门与 explore 轮未在这里验证，且四个主机
+  侧怪癖要靠手工环境变量绕过（见 §5 决策环），直到代码自己认识昇腾。
 - 没有内核后端：`kernelforge` 不支持 Ascend C 或 Triton-Ascend，GEAK 也没有 NPU 路径。
 - 没有量化集成（msModelSlim），没有多机（单节点之外的 HCCL/拓扑）。
 - AgentX 客户端环境是 x86_64 专用（`pins.AGENTX_PYTHON_BUILD`、`client_env.LOCK_PLATFORMS`），因此
@@ -149,9 +186,9 @@ GEMM（`aclnnMatmul_MatMulV2`）占设备时间 79%，平均 `aic_mac_ratio` 仅
 
 ## 8. 下一步任务
 
-1. **昇腾分析路由**——消费 `torch_npu` 采集产物（Text + Db），产出既有契约（`analysis.md`、
-   `kernel_candidates.json`、基于公开芯片峰值与 `aic_*` 流水线占比的 roofline）。验收：对一份 Qwen3-8B
-   采集给出 `analysis.md` 与候选清单，且 top 内核排名与人工排序一致。
+1. **分析路由加固**——路由已存在，一份真实 Qwen3-8B 采集已产出 `analysis.md` 与 9 个候选（其中 1 个可路由）。
+   还差：报告写出端已经在等的 roofline 旁挂文件（`kernel_roofline.json`）、没有 agent/网关时的确定性回退，
+   以及基于夹具的报告契约测试。
 2. **闭合决策环**——把 agent 角色指向网关，在 NPU 上跑 `hyperloom optimize`，让一次 TP2 启动按正常的
    阈值/噪声带被接受为 KEEP。验收：一次会话包含基线、一个被 KEEP 的候选、以及最终报告。
 3. **量化**——msModelSlim W8A8 权重经 vLLM-Ascend 起服，并由精度评测把门。验收：精度在阈值内的可测量

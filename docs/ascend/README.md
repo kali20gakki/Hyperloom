@@ -14,10 +14,10 @@ what is still missing.
 | Tool staging on aarch64 | **works** | `StagingProfile.INFERENCEX` stages only the InferenceX subset; the pinned AgentX client CPython is x86_64-only and is no longer required by a round that drives the server itself |
 | One benchmark round (`inference_suite run`) | **works** | boots `vllm serve` (vLLM-Ascend), loads it, writes `report.json` |
 | Capacity measurement and shape comparison (TP1 vs TP2) | **works** | see §6 |
-| Reading a trace and deriving candidates (TraceLens route) | **not wired** | TraceLens is imported directly and models AMD hardware; an Ascend analysis route is a task in §8 |
+| Reading a trace and deriving candidates | **works on Ascend** | `analysis_route=msagent`: a model reads the `torch_npu` capture through msprof-mcp under the msAgent profiler skills. TraceLens stays the AMD route |
 | Profile capture | **works** | vLLM-Ascend's own `torch_npu.profiler` wrapper, driven by `--profiler-config` and `/start_profile`/`/stop_profile` |
 | Kernel optimization | **not wired** | no Ascend kernel backend in `kernelforge`; kernel work is meant to be delegated (CANNBot workflows) |
-| KEEP/REVERT decisions (`hyperloom optimize`) | **not run end to end** | needs the Orchestration/Critic agent roles pointed at a gateway; the measurement half they decide on works |
+| KEEP/REVERT decisions (`hyperloom optimize`) | **boots and measures** | the Coordinator runs on a gateway model, resolves the base and measures the baseline on the card; the accuracy gate and the first KEEP are the open items |
 
 ## 2. Approach
 
@@ -120,6 +120,45 @@ vllm serve /models/Qwen3-8B --tensor-parallel-size 2 --max-model-len 4096 \
 
 Then resolve with `--gpus 2` and a `LaunchQuery` whose `tp` is `2`.
 
+### Analysis route (Ascend)
+
+An Ascend capture is read by a model through the `msprof-mcp` tools and the msAgent profiler skills:
+
+```bash
+export HYPERLOOM_MSAGENT_SKILLS=/path/to/msagent/skills/profiler
+export HYPERLOOM_MSPROF_MCP=/path/to/mcp-venv/bin/msprof-mcp   # an interpreter with mcp<2
+export OPENAI_BASE_URL=... OPENAI_API_KEY=... CODEX_MODEL=<model>
+python -m hyperloom.orchestrator.trace_analysis.msagent_analysis \
+    --trace-dir <round trace directory> --out <analysis directory> --framework vllm
+```
+
+It discovers the `ASCEND_PROFILER_OUTPUT` directory, runs one agent turn over the database and CSVs, checks the JSON
+the model wrote against the report contract, and publishes `analysis.md` and `kernel_candidates.json` (the latter with
+the `hot_kernels` / `routable_kernels` / `skipped_kernels` / `task_groups` shape the orchestrator reads). A requested
+`trace_analyze` with `analysis_route=msagent` enters the same module, so the coordinator path and the direct command
+share one implementation.
+
+### Decision loop
+
+```bash
+export HYPERLOOM_DEVICE_BACKEND=ascend
+export HYPERLOOM_SKIP_FRAMEWORK_CHECK=1          # the preflight's "is this a ROCm build" probe
+export KERNEL_AGENT_ENV=<file>                   # the kernel-agent env install.sh normally writes
+export HYPERLOOM_CODEX_SANDBOX_MODE=bypass       # no working bubblewrap on this host
+export INFERENCE_SUITE_TOOL_CACHE=<staged cache>
+export INFERENCE_OPTIMIZER_RAY_EXEC=0            # Ray sees no GPUs on an NPU host
+export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1   # a "[::1]" entry breaks httpx parsing
+
+python -m hyperloom optimize --framework vllm --gpu-type 910b3 --model <model path> \
+    --reference-script serve.sh --tp 1 --conc 64 --isl 1024 --osl 1024 \
+    --max-hours 0.3 --no-kernel --no-enable-roofline --enablement off
+```
+
+The orchestration and critic roles run on the gateway model (`INFERENCE_OPTIMIZER_AGENT_BACKEND=codex`,
+`CODEX_MODEL=<model>`). The run resolves the reference launch, boots the vLLM-Ascend server and measures the baseline
+round on the card. The accuracy gate that follows it, and the first KEEP from an `explore` round, are the remaining
+work in §8.
+
 ## 6. Measured results
 
 Qwen3-8B, ISL/OSL 1024, concurrency 64, 128 prompts, one node, prefix caching as the launch leaves it.
@@ -143,9 +182,11 @@ weight quantization (not yet run).
 
 ## 7. Known limitations
 
-- No Ascend analysis route yet: `trace_analyze` still enters TraceLens, which is AMD-shaped.
-- `hyperloom optimize` is not run end to end: the Orchestration/Critic roles need a model gateway, and the
-  KEEP/REVERT pipeline around the now-working measurement has not been exercised on NPU.
+- The Ascend analysis route needs an agent CLI, a gateway and an `mcp<2` interpreter for msprof-mcp; none of that is
+  in the default install.
+- `hyperloom optimize` reaches the baseline round on NPU but not yet a KEEP: the accuracy gate and the explore
+  rounds are untested here, and four host quirks (§5, "Decision loop") have to be set by hand until the code learns
+  about Ascend.
 - No kernel backend: `kernelforge` has no Ascend C or Triton-Ascend language support, and GEAK has no NPU path.
 - No quantization integration (msModelSlim), no multi-node (HCCL/VLLM topology beyond one node).
 - The AgentX client environment is x86_64-only (`pins.AGENTX_PYTHON_BUILD`, `client_env.LOCK_PLATFORMS`), so
@@ -154,10 +195,10 @@ weight quantization (not yet run).
 
 ## 8. Next steps
 
-1. **Ascend analysis route** — consume a `torch_npu` capture (Text + Db) and produce the existing contract
-   (`analysis.md`, `kernel_candidates.json`, roofline from published chip peaks and `aic_*` pipeline ratios).
-   Acceptance: an `analysis.md` and candidate list for a Qwen3-8B capture, and the top kernels match a manual
-   ranking.
+1. **Analysis route hardening** — the route exists and a live Qwen3-8B capture produced `analysis.md` and nine
+   candidates, one of them routable. What remains: a roofline sidecar the report writer already expects
+   (`kernel_roofline.json`), a deterministic fallback when no agent or gateway is configured, and a fixture-based
+   test of the report contract.
 2. **Close the decision loop** — point the agent roles at a gateway and run `hyperloom optimize` on the NPU so
    a TP2 launch is accepted as a KEEP through the normal threshold/noise band. Acceptance: one session with
    baseline, one kept candidate, and a final report.

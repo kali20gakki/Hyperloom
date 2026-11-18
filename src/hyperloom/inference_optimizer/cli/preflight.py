@@ -32,6 +32,8 @@ from hyperloom_common.llm.llm_config import (
 from hyperloom_common.env import forge_explicitly_enabled
 from hyperloom_common.llm.llm_headers import expand_env_refs
 from hyperloom_common.gpu_identity import AMD_GPU_BOARDS
+
+from hyperloom.inference_optimizer.gpu_types import ASCEND_NPU_BOARDS
 from hyperloom.common.platform_probe import probe_cpu_platform
 from hyperloom_common.pr_monitor_urls import kb_store_url
 from hyperloom.common.provenance import (
@@ -577,7 +579,7 @@ def _check_gfx_arch_resolvable(gpu_type: str | None = None) -> None:
     """Warn when the GPU architecture cannot be resolved for provenance."""
     if detect_gfx_arch(os.environ, gpu_type=gpu_type):
         return
-    boards = "/".join(sorted(AMD_GPU_BOARDS))
+    boards = "/".join(sorted({*AMD_GPU_BOARDS, *ASCEND_NPU_BOARDS}))
     print(
         "Preflight: WARNING — GPU architecture could not be resolved; provenance "
         "will record gfx_arch as null, so an archived report will not say which "
