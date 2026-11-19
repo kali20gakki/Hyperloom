@@ -210,6 +210,9 @@ GEMM（`aclnnMatmul_MatMulV2`）占设备时间 79%，平均 `aic_mac_ratio` 仅
 结合上面的形态对比：这个负载上**参数层已经饱和**——最好的候选落在噪声带内，能改变数字的是“每 token 搬运
 的字节数”：张量并行（已测）与权重量化（尚未跑）。
 
+8 卡 Qwen3-4B 这次会话的独立记录（环境、逐候选数据、两个 KEEP、期间的主机事故）见
+[docs/ascend/experiments/2026-11-19-qwen3-4b-dp8.md](docs/ascend/experiments/2026-11-19-qwen3-4b-dp8.md)。
+
 ## 7. 已知限制
 
 - 昇腾分析路由需要 agent CLI、模型网关，以及一个装了 `mcp<2` 的解释器来跑 msprof-mcp；这些都不在默认安装里。

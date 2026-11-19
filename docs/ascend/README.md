@@ -219,6 +219,9 @@ Read with the shape comparison above, this says the parameter layer is saturated
 candidate lands inside the noise band, and the levers that move the number are transfers per token — tensor parallel
 (measured) and weight quantization (not yet run).
 
+A standalone record of the eight-card Qwen3-4B session — setup, per-candidate numbers, the two keeps, and the host
+incidents around it — is in [experiments/2026-11-19-qwen3-4b-dp8.md](experiments/2026-11-19-qwen3-4b-dp8.md).
+
 ## 7. Known limitations
 
 - The Ascend analysis route needs an agent CLI, a gateway and an `mcp<2` interpreter for msprof-mcp; none of that is
