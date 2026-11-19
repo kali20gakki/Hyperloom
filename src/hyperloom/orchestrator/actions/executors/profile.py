@@ -819,9 +819,11 @@ def _ascend_capture(workspace: Path) -> Path | None:
     torch_npu writes a ``<name>_ascend_pt`` tree first and leaves parsing to ``analyse``; the capture is recognized by
     that directory, parsed or not, because a raw one still holds every event the analysis needs.
     """
-    for candidate in sorted(workspace.rglob("*" + _ASCEND_CAPTURE_SUFFIX)):
-        if candidate.is_dir():
-            return candidate
+    candidates = [c for c in sorted(workspace.rglob("*" + _ASCEND_CAPTURE_SUFFIX)) if c.is_dir()]
+    # A multi-rank capture leaves one directory per rank; take a parsed one when any rank has it, so the round does
+    # not re-run `analyse` on a capture another rank already parsed.
+    for candidate in [c for c in candidates if (c / _ASCEND_OUTPUT_DIR).is_dir()] or candidates:
+        return candidate
     if (workspace / _ASCEND_OUTPUT_DIR).is_dir():
         return workspace
     return None

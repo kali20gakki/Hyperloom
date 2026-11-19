@@ -93,3 +93,15 @@ def test_an_unparseable_capture_is_still_recorded_for_the_analysis_route(tmp_pat
 
     assert result["capture_parsed"] is False
     assert result["trace_dir"] and Path(str(result["trace_dir"])).name.endswith("_ascend_pt")
+
+
+def test_a_parsed_rank_is_preferred_over_a_raw_one(tmp_path: Path) -> None:
+    """Multi-rank runs leave one capture per rank; the round should not re-parse what a rank already parsed."""
+    workspace = tmp_path
+    raw = workspace / "rank0_raw_ascend_pt"
+    raw.mkdir()
+    (raw / "PROF_1").mkdir()
+    parsed = workspace / "rank1_parsed_ascend_pt"
+    (parsed / pf._ASCEND_OUTPUT_DIR).mkdir(parents=True)
+
+    assert pf._ascend_capture(workspace) == parsed
