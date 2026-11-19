@@ -2,8 +2,8 @@
 
 > 中文版（仓库首页）：[README.md](../../README.md)
 
-Status: **bring-up spike**. The measurement path runs on Ascend NPUs today; the analysis, kernel and
-decision layers are partly wired. This document states what runs, how to run it, what changed in the tree, and
+Status: **bring-up spike**. The measurement, analysis and decision paths run on Ascend NPUs today; the kernel
+and quantization layers are not wired. This document states what runs, how to run it, what changed in the tree, and
 what is still missing.
 
 ## 1. What runs
@@ -17,7 +17,7 @@ what is still missing.
 | Reading a trace and deriving candidates | **works on Ascend** | `analysis_route=msagent`: a model reads the `torch_npu` capture through msprof-mcp under the msAgent profiler skills. TraceLens stays the AMD route |
 | Profile capture | **works** | vLLM-Ascend's own `torch_npu.profiler` wrapper, driven by `--profiler-config` and `/start_profile`/`/stop_profile` |
 | Kernel optimization | **not wired** | no Ascend kernel backend in `kernelforge`; kernel work is meant to be delegated (CANNBot workflows) |
-| KEEP/REVERT decisions (`hyperloom optimize`) | **runs end to end; no KEEP yet** | the Coordinator runs on a gateway model, measures the baseline on the card (1509 tok/s) and closes the session; the budget it had left could not fit an `explore` round |
+| KEEP/REVERT decisions (`hyperloom optimize`) | **runs end to end** | a 2 h session measured the baseline (1519.8 tok/s) and five seeded candidates, and reverted all five; the stack stayed empty because none cleared the 1% threshold (§6) |
 
 ## 2. Approach
 
@@ -169,10 +169,16 @@ Codex's own sandbox needs bubblewrap: install it (`apt install bubblewrap`), or 
 `HYPERLOOM_CODEX_SANDBOX_MODE=bypass` on a dedicated container.
 
 The orchestration and critic roles run on the gateway model (`INFERENCE_OPTIMIZER_AGENT_BACKEND=codex`,
-`CODEX_MODEL=<model>`). The run resolves the reference launch, boots the vLLM-Ascend server, measures the baseline
-round, passes its accuracy gate and closes. A baseline of one card costs 15–20 minutes (model load, one warmup plus
-measured round, and the eval), so a session that is also to try candidates needs a budget well above that — the
-0.4 h run here closed with `time_exhausted` at a measured baseline of 1509 tok/s and no `explore` round.
+`CODEX_MODEL=<model>`). A session that has to outlive the shell it was started from runs under systemd — that is how
+the completed run in §6 was made, after a plain `tmux`/`setsid` launch died in preflight here:
+
+```bash
+sudo systemd-run --unit=hl-keep --collect --working-directory=<repo> ./run-keep.sh
+journalctl -u hl-keep -f            # the script's own log sits beside it
+```
+
+A baseline of one card costs 15–20 minutes (model load, one warmup plus measured round, and the eval), and each
+candidate costs about 7 minutes more, so a session that is to try a grid needs a couple of hours.
 
 ## 6. Measured results
 
@@ -195,13 +201,30 @@ reserve-ISL toggle was neutral (1434.5 → 1434.6 tok/s), and `TASK_QUEUE_ENABLE
 capture. The levers that do are the ones that spread or shrink the weight stream — tensor parallel (above) and
 weight quantization (not yet run).
 
+### Decision-loop run (2 h, one 910B3)
+
+Baseline **1519.8 tok/s** (320 prompts, GSM8K 0.90625), then the five seeded candidates. Every one was reverted:
+the stack stayed empty, `cumulative_gain_val` is 0, and the session closed with `stop_reason=time_exhausted`.
+
+| Candidate | tok/s | vs baseline | Verdict |
+|---|---:|---:|---|
+| baseline | 1519.8 | — | — |
+| `v00` decode-only graph (`cudagraph_mode=FULL_DECODE_ONLY`) | 1474.0 | −3.0% | REVERT |
+| `v01` `--no-scheduler-reserve-full-isl` | 1511.7 | −0.5% | REVERT (`gain_below_threshold`) |
+| `v02` `--max-num-seqs 128` | 1513.9 | −0.4% | REVERT |
+| `v03` `--max-num-batched-tokens 16384` | 1524.7 | +0.3% | REVERT |
+| `v04` `--no-enable-prefix-caching` | 1533.9 | +0.9% | REVERT (below the 1% threshold) |
+
+Read with the shape comparison above, this says the parameter layer is saturated for this workload: the best
+candidate lands inside the noise band, and the levers that move the number are transfers per token — tensor parallel
+(measured) and weight quantization (not yet run).
+
 ## 7. Known limitations
 
 - The Ascend analysis route needs an agent CLI, a gateway and an `mcp<2` interpreter for msprof-mcp; none of that is
   in the default install.
-- `hyperloom optimize` reaches the baseline round on NPU but not yet a KEEP: the accuracy gate and the explore
-  rounds are untested here, and four host quirks (§5, "Decision loop") have to be set by hand until the code learns
-  about Ascend.
+- No candidate has been kept: the parameter layer is saturated on this workload (§6). A gain needs quantization
+  or a different deployment shape, and neither is wired yet.
 - No kernel backend: `kernelforge` has no Ascend C or Triton-Ascend language support, and GEAK has no NPU path.
 - No quantization integration (msModelSlim), no multi-node (HCCL/VLLM topology beyond one node).
 - The AgentX client environment is x86_64-only (`pins.AGENTX_PYTHON_BUILD`, `client_env.LOCK_PLATFORMS`), so
@@ -210,15 +233,14 @@ weight quantization (not yet run).
 
 ## 8. Next steps
 
-1. **Analysis route hardening** — the route exists and a live Qwen3-8B capture produced `analysis.md` and nine
-   candidates, one of them routable. What remains: a roofline sidecar the report writer already expects
-   (`kernel_roofline.json`), a deterministic fallback when no agent or gateway is configured, and a fixture-based
-   test of the report contract.
-2. **Close the decision loop** — point the agent roles at a gateway and run `hyperloom optimize` on the NPU so
-   a TP2 launch is accepted as a KEEP through the normal threshold/noise band. Acceptance: one session with
-   baseline, one kept candidate, and a final report.
-3. **Quantization** — msModelSlim W8A8 weights through vLLM-Ascend, gated on the accuracy eval. Acceptance:
-   a measured throughput gain with accuracy inside the threshold.
+1. **Quantization** — msModelSlim W8A8 weights through vLLM-Ascend, gated on the accuracy eval. This is the
+   lever the profile supports and the one the saturated parameter layer leaves: acceptance is a kept candidate
+   above the 1% threshold with accuracy inside the eval's tolerance.
+2. **Tensor parallel as a deployment shape** — TP2 is measured at +34.4% but is not a same-shape optimization;
+   make the session able to propose it (the base launches at TP1 today) and keep it through the normal verdict.
+3. **Analysis route hardening** — the route exists and a live capture produced `analysis.md` and six candidates,
+   one routable. What remains: the roofline sidecar the report writer expects (`kernel_roofline.json`) and a
+   deterministic fallback when no agent or gateway is configured.
 4. **Kernel delegation** — hand a hot operator to the CANNBot Triton-Ascend / Ascend C workflows, integrate the
    result, and measure it end to end. Acceptance: one operator with a measured speedup and unchanged accuracy.
 5. **AgentX on aarch64** — add an aarch64 interpreter pin and a matching client lock so `agentx`/`mlperf`

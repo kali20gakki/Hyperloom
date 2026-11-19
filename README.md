@@ -4,7 +4,7 @@
 > [docs/ascend/README.md](docs/ascend/README.md)；上游项目原始 README 保留在
 > [README.upstream.md](README.upstream.md)。
 
-状态：**bring-up 阶段**。测量链路已经能在昇腾 NPU 上跑通；分析层、内核层与决策层部分接通。
+状态：**bring-up 阶段**。测量、分析与决策三条链路已经能在昇腾 NPU 上跑通；内核层与量化尚未接通。
 本文说明能跑什么、怎么跑、改了哪些地方，以及还缺什么。
 
 ## 1. 当前可运行的部分
@@ -18,7 +18,7 @@
 | 读 trace 派生候选 | **昇腾上可运行** | `analysis_route=msagent`：模型通过 msprof-mcp 与 msAgent profiler 技能读 `torch_npu` 采集；TraceLens 仍是 AMD 路由 |
 | Profile 采集 | **可运行** | vLLM-Ascend 自带的 `torch_npu.profiler` 封装，由 `--profiler-config` 与 `/start_profile`、`/stop_profile` 驱动 |
 | 算子优化 | **未接通** | `kernelforge` 没有昇腾内核后端；内核工作按委托方式接入（CANNBot 工作流） |
-| KEEP/REVERT 判定（`hyperloom optimize`） | **端到端跑通；尚无 KEEP** | Coordinator 跑在网关模型上，测出基线（1509 tok/s）并正常收尾；预算不足未能挤进一轮 `explore` |
+| KEEP/REVERT 判定（`hyperloom optimize`） | **端到端跑通** | 一次 2 小时会话测出基线（1519.8 tok/s）和 5 个种子候选，全部 REVERT；栈为空，因为没有候选越过 1% 阈值（见 §6） |
 
 ## 2. 方案
 
@@ -162,10 +162,17 @@ NPU（不再是“是不是 ROCm 构建”）、NPU 主机上 Ray 默认关闭�
 条目、板卡通过 `npu-smi` 自动识别。codex 自带的沙箱需要 bubblewrap：装它（`apt install bubblewrap`），
 或在专用容器里设 `HYPERLOOM_CODEX_SANDBOX_MODE=bypass`。
 
-编排与评审角色跑在网关模型上（`INFERENCE_OPTIMIZER_AGENT_BACKEND=codex`、`CODEX_MODEL=<模型>`）。运行会解析
-参考启动脚本、拉起 vLLM-Ascend 服务、测出基线轮并通过精度门，然后正常收尾。单卡基线一次要 15–20 分钟
-（加载模型、预热轮 + 测量轮、精度评测），所以还要试候选的会话预算必须远高于此——这里 0.4 h 的那次以
-`time_exhausted` 收尾，基线 1509 tok/s，没轮到 `explore`。
+编排与评审角色跑在网关模型上（`INFERENCE_OPTIMIZER_AGENT_BACKEND=codex`、`CODEX_MODEL=<模型>`）。要活得比
+启动它的 shell 更久的会话，用 systemd 托管——下面 §6 那次跑满 2 小时的会话就是这么起的（普通
+`tmux`/`setsid` 在这台机器上会在预检阶段被回收）：
+
+```bash
+sudo systemd-run --unit=hl-keep --collect --working-directory=<仓库> ./run-keep.sh
+journalctl -u hl-keep -f            # 脚本自己的日志在脚本旁边
+```
+
+单卡基线一次 15–20 分钟（加载模型、预热轮 + 测量轮、精度评测），每个候选再加约 7 分钟，所以还要试网格的
+会话需要两小时量级的预算。
 
 ## 6. 实测结果
 
@@ -186,11 +193,27 @@ GEMM（`aclnnMatmul_MatMulV2`）占设备时间 79%，平均 `aic_mac_ratio` 仅
 开关是中性（1434.5 → 1434.6 tok/s），`TASK_QUEUE_ENABLE=2` 在图捕获下被拒绝。有效的杠杆是摊薄或缩小权重
 流——张量并行（见上）与权重量化（尚未跑）。
 
+### 决策环实跑（2 小时，单卡 910B3）
+
+基线 **1519.8 tok/s**（320 请求，GSM8K 0.90625），随后 5 个种子候选。全部 REVERT：栈为空、
+`cumulative_gain_val` 为 0，会话以 `stop_reason=time_exhausted` 收尾。
+
+| 候选 | 吞吐 | 相对基线 | 判决 |
+|---|---:|---:|---|
+| 基线 | 1519.8 | — | — |
+| `v00` decode-only 图模式（`cudagraph_mode=FULL_DECODE_ONLY`） | 1474.0 | −3.0% | REVERT |
+| `v01` `--no-scheduler-reserve-full-isl` | 1511.7 | −0.5% | REVERT（`gain_below_threshold`） |
+| `v02` `--max-num-seqs 128` | 1513.9 | −0.4% | REVERT |
+| `v03` `--max-num-batched-tokens 16384` | 1524.7 | +0.3% | REVERT |
+| `v04` `--no-enable-prefix-caching` | 1533.9 | +0.9% | REVERT（低于 1% 阈值） |
+
+结合上面的形态对比：这个负载上**参数层已经饱和**——最好的候选落在噪声带内，能改变数字的是“每 token 搬运
+的字节数”：张量并行（已测）与权重量化（尚未跑）。
+
 ## 7. 已知限制
 
 - 昇腾分析路由需要 agent CLI、模型网关，以及一个装了 `mcp<2` 的解释器来跑 msprof-mcp；这些都不在默认安装里。
-- `hyperloom optimize` 在 NPU 上能起到基线轮，但还没有 KEEP：精度门与 explore 轮未在这里验证，且四个主机
-  侧怪癖要靠手工环境变量绕过（见 §5 决策环），直到代码自己认识昇腾。
+- 还没有 KEEP：这个负载上参数层已饱和（见 §6）。收益要靠量化或换部署形态，两者都尚未接通。
 - 没有内核后端：`kernelforge` 不支持 Ascend C 或 Triton-Ascend，GEAK 也没有 NPU 路径。
 - 没有量化集成（msModelSlim），没有多机（单节点之外的 HCCL/拓扑）。
 - AgentX 客户端环境是 x86_64 专用（`pins.AGENTX_PYTHON_BUILD`、`client_env.LOCK_PLATFORMS`），因此
@@ -199,13 +222,12 @@ GEMM（`aclnnMatmul_MatMulV2`）占设备时间 79%，平均 `aic_mac_ratio` 仅
 
 ## 8. 下一步任务
 
-1. **分析路由加固**——路由已存在，一份真实 Qwen3-8B 采集已产出 `analysis.md` 与 9 个候选（其中 1 个可路由）。
-   还差：报告写出端已经在等的 roofline 旁挂文件（`kernel_roofline.json`）、没有 agent/网关时的确定性回退，
-   以及基于夹具的报告契约测试。
-2. **闭合决策环**——把 agent 角色指向网关，在 NPU 上跑 `hyperloom optimize`，让一次 TP2 启动按正常的
-   阈值/噪声带被接受为 KEEP。验收：一次会话包含基线、一个被 KEEP 的候选、以及最终报告。
-3. **量化**——msModelSlim W8A8 权重经 vLLM-Ascend 起服，并由精度评测把门。验收：精度在阈值内的可测量
-   吞吐收益。
+1. **量化**——msModelSlim W8A8 权重经 vLLM-Ascend 起服，并由精度评测把门。这是 profile 支持的杠杆，也是
+   参数层饱和后剩下的那一个。验收：一个越过 1% 阈值并被 KEEP 的候选，且精度在评测容差内。
+2. **把张量并行作为部署形态**——TP2 已测 +34.4%，但它不是“同形态优化”；让会话能提出它（现在 base 固定
+   TP1）并按正常判决保留。
+3. **分析路由加固**——路由已存在，真实采集已产出 `analysis.md` 与 6 个候选（1 个可路由）。还差报告端在等的
+   `kernel_roofline.json` 旁挂文件，以及没有 agent/网关时的确定性回退。
 4. **内核委托**——把热点算子交给 CANNBot 的 Triton-Ascend / Ascend C 工作流，集成结果并做端到端测量。
    验收：单个算子有可测加速且精度不变。
 5. **aarch64 上的 AgentX**——补 aarch64 解释器 pin 与配套客户端 lock，使 `agentx`/`mlperf` 负载能在 arm
