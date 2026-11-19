@@ -136,8 +136,11 @@ python -m hyperloom.orchestrator.trace_analysis.msagent_analysis \
 
 ### Profile 采集
 
-昇腾上的 profile 轮次会写出 `*_ascend_pt/ASCEND_PROFILER_OUTPUT`，执行器把它记为这一轮的 trace
-（`capture_format: ascend_pt`），未指定路由的 `trace_analyze` 会走 msagent 路由。默认采集窗口是按 AMD 的
+昇腾上的 profile 轮次先写出原始 `*_ascend_pt`（`PROF_*`、`FRAMEWORK/`），解析由
+`torch_npu.profiler.profiler.analyse` 完成；执行器会跑这一步，再把采集记为这一轮的 trace
+（`capture_format: ascend_pt`、`capture_parsed`），未指定路由的 `trace_analyze` 走 msagent 路由。
+CANN 用主机自己的安装（本机是 `source /home/smoke/Ascend/ascend-toolkit/set_env.sh`）：它会把 `bisheng`
+放进 `PATH`，否则 vLLM 报 `HAS_TRITON=False`，vllm-ascend 不注册 Qwen3 需要的 Triton 算子。默认采集窗口是按 AMD 的
 长跑算的，短轮次里 profiler 根本不会启动，需要手动收窄：
 
 ```bash

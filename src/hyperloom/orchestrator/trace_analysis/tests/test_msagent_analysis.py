@@ -139,3 +139,24 @@ def test_run_analysis_publishes_the_two_artifacts(tmp_path: Path, monkeypatch: p
     assert [row["patchable"] for row in document["hot_kernels"]] == [False, True]
     assert document["routable_kernels"] == [document["hot_kernels"][1]]
     assert document["skipped_kernels"] == [document["hot_kernels"][0]]
+
+
+def test_a_raw_capture_is_parsed_with_torch_npus_analyse(tmp_path):
+    """The profiler leaves PROF_* trees; `ensure_parsed` runs `analyse` in the framework's interpreter."""
+    capture = tmp_path / "rank0_1_ascend_pt"
+    (capture / "PROF_000001_x").mkdir(parents=True)
+
+    stub = tmp_path / "analyse-stub.sh"
+    stub.write_text('#!/bin/sh\nmkdir -p "$3/ASCEND_PROFILER_OUTPUT"\n', encoding="utf-8")
+    stub.chmod(0o755)
+
+    assert route.ensure_parsed(capture, python=str(stub)) == capture
+    assert (capture / route.CAPTURE_OUTPUT_DIR).is_dir()
+
+
+def test_an_analyse_that_leaves_nothing_raises_with_the_call_in_the_message(tmp_path):
+    capture = tmp_path / "rank0_1_ascend_pt"
+    capture.mkdir()
+
+    with pytest.raises(route.AnalysisError):
+        route.ensure_parsed(capture, python="/bin/false")

@@ -140,9 +140,12 @@ share one implementation.
 
 ### Profile capture
 
-A profile round on an Ascend host writes `*_ascend_pt/ASCEND_PROFILER_OUTPUT` under the round's trace directory;
-the executor records that directory as the round's trace (`capture_format: ascend_pt`) and a `trace_analyze` that
-names no route goes to the msagent one. The default capture window is computed for a much longer AMD run, so the
+A profile round on an Ascend host writes a raw `*_ascend_pt` tree (`PROF_*`, `FRAMEWORK/`) and leaves parsing to
+`torch_npu.profiler.profiler.analyse`; the executor runs that step, records the capture as the round's trace
+(`capture_format: ascend_pt`, `capture_parsed`) and a `trace_analyze` that names no route goes to the msagent one.
+Point the environment at the host's CANN install (`source /home/smoke/Ascend/ascend-toolkit/set_env.sh` here): the
+toolkit's own `set_env.sh` is what puts `bisheng` on `PATH`, and without it vLLM reports `HAS_TRITON=False` and
+vllm-ascend skips the Triton ops a Qwen3 serve needs. The default capture window is computed for a much longer AMD run, so the
 profiler never starts inside a short NPU round; bound it:
 
 ```bash

@@ -10,6 +10,8 @@ import gzip
 import json
 import logging
 import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -805,29 +807,63 @@ _ASCEND_OUTPUT_DIR = "ASCEND_PROFILER_OUTPUT"
 _ASCEND_CAPTURE_SUFFIX = "_ascend_pt"
 
 
+#: The torch_npu call that turns a raw ``*_ascend_pt`` tree into ``ASCEND_PROFILER_OUTPUT``; parsing a large capture
+#: takes a couple of minutes, so the wait is bounded well above that.
+_ASCEND_ANALYSE_TIMEOUT_SEC = 1800.0
+_ASCEND_ANALYSE_CALL = "from torch_npu.profiler.profiler import analyse; import sys; analyse(sys.argv[1])"
+
+
 def _ascend_capture(workspace: Path) -> Path | None:
     """The Ascend profiler capture this run left under ``workspace``, or ``None`` on a host that wrote none.
 
-    torch_npu writes ``<name>_ascend_pt/ASCEND_PROFILER_OUTPUT`` — a SQLite database and CSVs, not a Kineto
-    ``*.trace.json.gz`` — so a capture is recognized by that directory rather than by a trace file.
+    torch_npu writes a ``<name>_ascend_pt`` tree first and leaves parsing to ``analyse``; the capture is recognized by
+    that directory, parsed or not, because a raw one still holds every event the analysis needs.
     """
     for candidate in sorted(workspace.rglob("*" + _ASCEND_CAPTURE_SUFFIX)):
-        if candidate.is_dir() and (candidate / _ASCEND_OUTPUT_DIR).is_dir():
+        if candidate.is_dir():
             return candidate
     if (workspace / _ASCEND_OUTPUT_DIR).is_dir():
         return workspace
     return None
 
 
+def _parse_ascend_capture(capture: Path, *, runner: Any = None) -> bool:
+    """Run torch_npu's ``analyse`` over a raw capture; True when the output directory exists afterwards."""
+    if (capture / _ASCEND_OUTPUT_DIR).is_dir():
+        return True
+    run = runner or subprocess.run
+    try:
+        proc = run(
+            [sys.executable, "-c", _ASCEND_ANALYSE_CALL, str(capture)],
+            capture_output=True,
+            text=True,
+            timeout=_ASCEND_ANALYSE_TIMEOUT_SEC,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("profile_executor: Ascend analyse did not run on %s: %r", capture, exc)
+        return False
+    if getattr(proc, "returncode", 0) != 0:
+        tail = ((getattr(proc, "stderr", "") or getattr(proc, "stdout", "")) or "").strip().splitlines()[-3:]
+        log.warning("profile_executor: Ascend analyse failed on %s: %s", capture, " | ".join(tail))
+    return (capture / _ASCEND_OUTPUT_DIR).is_dir()
+
+
 def _record_ascend_capture(result: dict[str, Any], capture: Path) -> None:
     """Record an Ascend capture as this round's trace: the analysis route reads its database and CSVs."""
+    parsed = _parse_ascend_capture(capture)
     result["trace_dir"] = str(capture)
     result["trace_files"] = []
     result["main_trace_path"] = str(capture)
     result["capture_format"] = "ascend_pt"
+    result["capture_parsed"] = parsed
     result["profile_trace_selection_reason"] = "ascend_pt_capture"
     result["trace_health"] = {"issues": [], "checks": [], "capture_traces_present": False, "zero_ops": False}
-    log.info("profile_executor: Ascend capture %s (no Kineto trace on this host)", capture)
+    log.info(
+        "profile_executor: Ascend capture %s (%s; no Kineto trace on this host)",
+        capture,
+        "parsed" if parsed else "left raw for the analysis route to parse",
+    )
 
 
 # Attaches the single-node trace dir this run produced, and certifies it.

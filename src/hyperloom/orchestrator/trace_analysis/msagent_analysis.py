@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -89,6 +90,40 @@ def is_ascend_capture(trace_dir: Path | str) -> bool:
         return path.is_dir() and (path / CAPTURE_OUTPUT_DIR).is_dir()
     except OSError:
         return False
+
+
+#: ``torch_npu.profiler.profiler.analyse`` turns a raw ``*_ascend_pt`` tree into ``ASCEND_PROFILER_OUTPUT``; it
+#: runs in the framework's interpreter and can take a couple of minutes for a large capture.
+ANALYSE_TIMEOUT_SEC = 1800.0
+_DIRECT_PARSER = "from torch_npu.profiler.profiler import analyse; import sys; analyse(sys.argv[1])"
+
+
+def ensure_parsed(capture_dir: Path | str, *, python: str | None = None) -> Path:
+    """Parse the raw capture at ``capture_dir`` when it holds no ``ASCEND_PROFILER_OUTPUT`` yet.
+
+    The profiler wrapper writes ``PROF_*`` trees and leaves parsing to ``analyse``; without that step the capture has
+    no database or CSVs to read. Returns the capture directory (now parsed) or raises ``AnalysisError``.
+    """
+    capture = Path(capture_dir)
+    if (capture / CAPTURE_OUTPUT_DIR).is_dir():
+        return capture
+    interpreter = python or os.environ.get("HYPERLOOM_FRAMEWORK_PYTHON") or sys.executable
+    log.info("msagent analysis: parsing %s with %s", capture, Path(interpreter).name)
+    try:
+        proc = subprocess.run(
+            [interpreter, "-c", _DIRECT_PARSER, str(capture)],
+            capture_output=True,
+            text=True,
+            timeout=ANALYSE_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AnalysisError(f"torch_npu analyse did not run on {capture}: {exc}") from exc
+    if proc.returncode != 0 and not (capture / CAPTURE_OUTPUT_DIR).is_dir():
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+        raise AnalysisError(f"torch_npu analyse failed on {capture}: " + " | ".join(detail))
+    if not (capture / CAPTURE_OUTPUT_DIR).is_dir():
+        raise AnalysisError(f"torch_npu analyse left no {CAPTURE_OUTPUT_DIR} under {capture}")
+    return capture
 
 
 def discover_capture(trace_dir: Path) -> Capture:
@@ -349,6 +384,10 @@ def run_analysis(
     Raises:
         AnalysisError: The capture is missing, the agent turn fails or times out, or what it wrote breaks the contract.
     """
+    if (Path(trace_dir).name.endswith(_ASCEND_CAPTURE_SUFFIX) or is_ascend_capture(trace_dir)) and not (
+        Path(trace_dir) / CAPTURE_OUTPUT_DIR
+    ).is_dir():
+        ensure_parsed(trace_dir)
     capture = discover_capture(trace_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
