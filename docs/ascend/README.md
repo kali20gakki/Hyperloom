@@ -31,8 +31,13 @@ each one rather than branching inside them:
    InferenceX's subset, so it does not need the AgentX client environment.
 3. **Analysis route** — frame a trace into a breakdown and kernel candidates. The contract (`analysis.md`,
    `kernel_candidates.json`, roofline targets) is unchanged; only the producer behind it is new.
-4. **Kernel delegate** — whole-pipeline or per-kernel optimization. GEAK has no NPU support, so an Ascend
-   session uses per-kernel/delegated work instead of GEAK's e2e workflow.
+4. **Kernel delegate** — whole-pipeline or per-kernel optimization. GEAK has no NPU support, so on Ascend the
+   layer is a delegated agent turn: `orchestrator/actions/executors/ascend_kernel_agent.py` reads the analysis'
+   candidates, edits the serving tree under a CANNBot skill tree (`HYPERLOOM_CANNBOT_SKILLS`), and writes
+   `kernel_patch.diff` + `kernel_agent_report.json` for the integrate step to apply and measure.
+5. **Quantization** — `msModelSlim` through its packaged skills (`HYPERLOOM_AGFSM_SKILLS`). The existing
+   quantization prelude already runs an agent before the loop; on Ascend it appends the msModelSlim instructions
+   (`ascend_quantize_agent.prompt_addendum`) and exports a checkpoint `vllm serve` can load on vLLM-Ascend.
 
 Two host facts drove the shape of the change:
 
@@ -222,6 +227,24 @@ Read with the shape comparison above, this says the parameter layer is saturated
 candidate lands inside the noise band, and the levers that move the number are transfers per token — tensor parallel
 (measured) and weight quantization (not yet run).
 
+### Delegated turns
+
+Both layers are ordinary headless agent turns, so they can be run on their own while the phase wiring is finished:
+
+```bash
+export HYPERLOOM_CANNBOT_SKILLS=<dir with */SKILL.md>
+python -m hyperloom.orchestrator.actions.executors.ascend_kernel_agent \
+    --candidates <session>/target_analysis/kernel_candidates.json --repo <serving tree> --out <dir>
+
+export HYPERLOOM_AGFSM_SKILLS=<dir with */SKILL.md>
+export HYPERLOOM_QUANTIZE_ENABLED=1          # the prelude's master switch
+python -m hyperloom.orchestrator.actions.executors.ascend_quantize_agent \
+    --model <source model> --out <dir>
+```
+
+The kernel turn's patch is the artifact the integrate/measure path consumes; the quantize turn's checkpoint is the
+model a round serves. Neither is a KEEP on its own — the session's normal verdict decides.
+
 A standalone record of the eight-card Qwen3-4B session — setup, per-candidate numbers, the two keeps, and the host
 incidents around it — is in [experiments/2026-11-19-qwen3-4b-dp8.md](experiments/2026-11-19-qwen3-4b-dp8.md).
 
@@ -239,10 +262,12 @@ incidents around it — is in [experiments/2026-11-19-qwen3-4b-dp8.md](experimen
 
 ## 8. Next steps
 
-1. **Quantization** — msModelSlim W8A8 weights through vLLM-Ascend, gated on the accuracy eval. This is the
-   lever the profile supports and the one the saturated parameter layer leaves: acceptance is a kept candidate
-   above the 1% threshold with accuracy inside the eval's tolerance.
-2. **Tensor parallel as a deployment shape** — TP2 is measured at +34.4% but is not a same-shape optimization;
+1. **Quantization** — the delegated turn and the prelude addendum are in; what remains is a real W8A8 run through
+   the accuracy gate. Acceptance: a kept candidate above the 1% threshold with accuracy inside the tolerance.
+2. **Kernel delegate hookup** — the delegated turn and its artifact contract are in; the KERNEL phase still routes to
+   GEAK's handoff protocol, so an Ascend session has no caller for it yet. Acceptance: a session that dispatches one
+   candidate to the CANNBot turn, applies the patch, measures it, and records a verdict.
+3. **Tensor parallel as a deployment shape** — TP2 is measured at +34.4% but is not a same-shape optimization;
    make the session able to propose it (the base launches at TP1 today) and keep it through the normal verdict.
 3. **Analysis route hardening** — the route exists and a live capture produced `analysis.md` and six candidates,
    one routable. What remains: the roofline sidecar the report writer expects (`kernel_roofline.json`) and a

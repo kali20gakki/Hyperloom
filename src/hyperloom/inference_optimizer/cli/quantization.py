@@ -46,6 +46,15 @@ async def _run_quantization_prelude(args: argparse.Namespace) -> None:
     if not prompt:
         return
 
+    # An Ascend host quantizes through msModelSlim, whose workflow is packaged as a skill tree rather than the
+    # vendor-neutral scheme enum; the addendum turns whatever the operator typed into that workflow.
+    from hyperloom_common.device_backend import is_ascend
+
+    if is_ascend():
+        from hyperloom.orchestrator.actions.executors.ascend_quantize_agent import prompt_addendum
+
+        prompt = f"{prompt}\n\n{prompt_addendum()}"
+
     # Deterministic master switch: quantization runs ONLY when $HYPERLOOM_QUANTIZE_ENABLED is truthy, regardless of
     # the flags.
     if not env_bool("HYPERLOOM_QUANTIZE_ENABLED"):
