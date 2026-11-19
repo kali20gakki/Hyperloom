@@ -249,8 +249,14 @@ python -m hyperloom.orchestrator.actions.executors.ascend_quantize_agent \
 The kernel turn's patch is the artifact the integrate/measure path consumes; the quantize turn's checkpoint is the
 model a round serves. Neither is a KEEP on its own — the session's normal verdict decides.
 
-A standalone record of the eight-card Qwen3-4B session — setup, per-candidate numbers, the two keeps, and the host
-incidents around it — is in [experiments/2026-11-19-qwen3-4b-dp8.md](experiments/2026-11-19-qwen3-4b-dp8.md).
+The eight-card Qwen3-4B shape was then given a four-hour session: baseline 10413.4, final 11356.5 tok/s,
+**`cumulative_gain_validated` 9.06%**, accuracy 0.9219. Both keeps are defaults that do not fit the shape —
+`enable_balance_scheduling` (+1.38%) and, on top of it, `--no-scheduler-reserve-full-isl` with
+`VLLM_USE_V2_MODEL_RUNNER=1` (+7.57%) — while all four conventional knobs lost. A single lever sits inside the noise
+floor (the baseline itself moved 9934 → 10413 between sessions); the combination is what is measurable.
+
+The standalone record of both sessions — setup, per-candidate numbers, the keeps, and the host incidents around
+them — is in [experiments/2026-11-19-qwen3-4b-dp8.md](experiments/2026-11-19-qwen3-4b-dp8.md).
 
 ## 7. Known limitations
 

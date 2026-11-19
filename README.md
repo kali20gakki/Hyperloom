@@ -196,6 +196,21 @@ GEMM（`aclnnMatmul_MatMulV2`）占设备时间 79%，平均 `aic_mac_ratio` 仅
 开关是中性（1434.5 → 1434.6 tok/s），`TASK_QUEUE_ENABLE=2` 在图捕获下被拒绝。有效的杠杆是摊薄或缩小权重
 流——张量并行（见上）与权重量化（尚未跑）。
 
+### 4 小时实跑，8 卡 DP8（Qwen3-4B）
+
+同一形态给了 4 小时预算，协调器跑了两轮网格并复测：**基线 10413.4 → 11356.5 tok/s，累计 `cumulative_gain_validated`
+9.06%，栈长 2，精度 0.9219**。两条 KEEP 都是“默认值不适配这个形态”，不是调参：
+
+| 改动 | 增益 |
+|---|---:|
+| `--additional-config '{"scheduler_config":{"enable_balance_scheduling":true}}'` | +1.38% |
+| 其上再 `--no-scheduler-reserve-full-isl` + `VLLM_USE_V2_MODEL_RUNNER=1` | +7.57% |
+
+同一轮里四个经典旋钮全部为负（reserve-ISL 单独 −0.3%、`max-num-seqs 512` −3.8%、`batched-tokens 16k` −3.6%、
+关 prefix cache −6.0%）。要点：**单个杠杆在噪声带内、组合起来才是 9%**；两次会话的基线本身就从 9934 漂到
+10413，所以单次 <5% 的增益不能当结论。详见
+[docs/ascend/experiments/2026-11-19-qwen3-4b-dp8.md](docs/ascend/experiments/2026-11-19-qwen3-4b-dp8.md)。
+
 ### 决策环实跑（2 小时，单卡 910B3）
 
 基线 **1519.8 tok/s**（320 请求，GSM8K 0.90625），随后 5 个种子候选。全部 REVERT：栈为空、
