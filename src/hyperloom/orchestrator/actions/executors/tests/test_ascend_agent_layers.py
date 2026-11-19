@@ -137,3 +137,29 @@ def test_an_ok_quantize_turn_without_a_checkpoint_is_refused(tmp_path: Path, mon
 
     with pytest.raises(quantize_agent.QuantizeAgentError):
         quantize_agent.run_quantize_agent(model, out, skills=None, run_agent=run)
+
+
+# --- skill catalogs -----------------------------------------------------------------------------------------------
+
+
+def test_the_catalog_reads_a_curated_root_of_symlinked_skill_dirs(tmp_path: Path) -> None:
+    """An operator points at a flat directory of links into a vendor tree; the catalog must see through the links."""
+    vendor = tmp_path / "vendor" / "skills" / "triton-npu-optimize"
+    vendor.mkdir(parents=True)
+    (vendor / "SKILL.md").write_text("# s\n", encoding="utf-8")
+    curated = tmp_path / "curated"
+    curated.mkdir()
+    (curated / "triton-npu-optimize").symlink_to(vendor)
+
+    assert kernel_agent._skill_catalog(curated) == ["triton-npu-optimize"]
+
+
+def test_the_catalog_reads_a_nested_vendor_tree(tmp_path: Path) -> None:
+    """A CANNBot checkout nests skills under plugins/<plugin>/skills/<name>; pointing at the checkout must work."""
+    skill = tmp_path / "cannbot" / "plugins-community" / "triton-optimizer" / "skills" / "triton-npu-optimize"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# s\n", encoding="utf-8")
+
+    catalog = kernel_agent._skill_catalog(tmp_path / "cannbot")
+
+    assert catalog == ["plugins-community/triton-optimizer/skills/triton-npu-optimize"]

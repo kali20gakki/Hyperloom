@@ -232,7 +232,11 @@ candidate lands inside the noise band, and the levers that move the number are t
 Both layers are ordinary headless agent turns, so they can be run on their own while the phase wiring is finished:
 
 ```bash
-export HYPERLOOM_CANNBOT_SKILLS=<dir with */SKILL.md>
+# CANNBot (https://gitcode.com/cann/cannbot): its kernel skills live under plugins/<plugin>/skills/<name>. Point the
+# variable at the checkout — the catalog recurses — or at a curated directory of links when one family is in scope.
+# The checkout carries 107 skills; the serving-path subset is triton-optimizer (15) plus ops-perf-optimize (10).
+git clone --depth 1 https://gitcode.com/cann/cannbot /opt/cannbot
+export HYPERLOOM_CANNBOT_SKILLS=/opt/cannbot/plugins-community/triton-optimizer/skills
 python -m hyperloom.orchestrator.actions.executors.ascend_kernel_agent \
     --candidates <session>/target_analysis/kernel_candidates.json --repo <serving tree> --out <dir>
 

@@ -42,8 +42,14 @@ def skills_root() -> Path | None:
 
 
 def _skill_catalog(root: Path) -> list[str]:
-    """The skill names under ``root`` that carry a ``SKILL.md``."""
-    return sorted(p.parent.name for p in root.glob("*/SKILL.md")) if root.is_dir() else []
+    """The skill directories under ``root``, named relative to it; a skills tree nests them at any depth."""
+    if not root.is_dir():
+        return []
+    # A curated root is a set of symlinks to skill directories, which rglob does not descend into; a vendor tree
+    # nests them one or more levels down, which the glob does not reach. Try the flat layout first.
+    flat = [str(marker.parent.relative_to(root)) for marker in root.glob("*/SKILL.md")]
+    nested = [str(marker.parent.relative_to(root)) for marker in root.rglob("SKILL.md")]
+    return sorted(set(flat) | set(nested))
 
 
 def prompt_addendum(*, skills: Path | None = None) -> str:
