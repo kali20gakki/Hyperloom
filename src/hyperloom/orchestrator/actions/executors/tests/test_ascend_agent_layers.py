@@ -44,23 +44,44 @@ def test_the_kernel_prompt_names_the_skills_and_the_patch_contract(tmp_path: Pat
     assert kernel_agent.REPORT_FILENAME in prompt
 
 
+def _git_repo_with_change(tmp_path: Path) -> tuple[Path, str]:
+    """A repository plus a patch that applies to it, shaped like what the turn is asked to produce."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    (repo / "vllm_ascend").mkdir(parents=True)
+    target = repo / "vllm_ascend" / "ops.py"
+    target.write_text("def fused():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base"], cwd=repo, check=True)
+    target.write_text("def fused():\n    return 2  # fused path\n", encoding="utf-8")
+    diff = subprocess.run(["git", "diff"], cwd=repo, capture_output=True, text=True, check=True).stdout
+    subprocess.run(["git", "checkout", "--", "."], cwd=repo, check=True)
+    return repo, diff
+
+
 def test_a_kernel_turn_returns_the_patch_it_wrote(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     out = tmp_path / "out"
+    repo, diff = _git_repo_with_change(tmp_path)
     monkeypatch.setattr(kernel_agent, "agent_argv", lambda *_a, **_kw: ["true"])
+    # The import gate runs the framework interpreter; the unit test pins its verdict instead of booting a runtime.
+    monkeypatch.setattr(kernel_agent, "import_gate", lambda *_a, **_kw: (True, ""))
 
     def run(argv: list[str], **_kw: object) -> int:
-        (out / kernel_agent.PATCH_FILENAME).write_text("diff --git a/x b/x\n", encoding="utf-8")
+        (out / kernel_agent.PATCH_FILENAME).write_text(diff, encoding="utf-8")
         (out / kernel_agent.REPORT_FILENAME).write_text(
-            json.dumps({"status": "ok", "kernel": "AddRmsNormBias", "files": ["vllm_ascend/ops/layernorm.py"]}),
+            json.dumps({"status": "ok", "kernel": "fused", "files": ["vllm_ascend/ops.py"]}),
             encoding="utf-8",
         )
         return 0
 
-    result = kernel_agent.run_kernel_agent(_candidates(tmp_path), tmp_path / "repo", out, skills=None, run_agent=run)
+    result = kernel_agent.run_kernel_agent(_candidates(tmp_path), repo, out, skills=None, run_agent=run)
 
     assert result["status"] == "ok"
     assert result["patch_path"].endswith(kernel_agent.PATCH_FILENAME)
-    assert result["files"] == ["vllm_ascend/ops/layernorm.py"]
+    assert result["files"] == ["vllm_ascend/ops.py"]
+    assert result["patch_applies"] is True
 
 
 def test_an_ok_kernel_turn_without_a_patch_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
