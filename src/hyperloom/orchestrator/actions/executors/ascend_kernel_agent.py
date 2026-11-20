@@ -79,8 +79,10 @@ Inputs
 {skills_block}
 
 Task
-1. Read the candidates and pick the single best one to implement (highest device-time share that a skill can
-   address; prefer a fused/combined operator over a new tiling when both are listed).
+1. Read the candidates and pick the single best one to implement: the largest `recoverable_share_pct` (device-time
+   share times the fraction the optimization takes back) that a skill can address, not the largest absolute time and
+   not the first row. Prefer the structural change — GEMM tiling/blocking or a weight layout, a PagedAttention or
+   producer-consumer change — over a micro-optimization when both are in reach.
 2. Implement it in the serving tree: replace or add the operator in the tree's own style, keeping the interface and
    numerics. Do not bump dependencies, do not reformat unrelated files, do not touch tests.
 3. Write your change as a unified diff at `{out_dir / PATCH_FILENAME}` (`git -C {repo} diff` is the expected shape).

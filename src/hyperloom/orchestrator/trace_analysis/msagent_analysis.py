@@ -202,8 +202,12 @@ only when a tool cannot, and say so.
 
 1. Decide which side binds the workload: compute, weight bandwidth, dispatch, or communication. Use the `aic_*`
    pipeline ratios and total device time, not intuition.
-2. Rank the kernels that dominate device time. For each, say what it is, its time and share, its core type and MAC
-   ratio, why it costs what it costs, and which optimization would change it.
+2. Rank the kernels by the device time each could actually recover: `share_pct` times the fraction of its own time the
+   optimization takes back (`expected_gain_pct`). A kernel at 2% of device time with 80% headroom matters more than one
+   at 30% with 2%; do not sort by name or by absolute time alone. For each, say what it is, its time and share, its core
+   type and MAC ratio, why it costs what it costs, and which optimization would change it — preferring the structural
+   change (GEMM tiling/blocking or weight layout for a matrix-bound profile, a PagedAttention or producer-consumer
+   change for an attention-bound one) over a micro-optimization of the same kernel.
 3. Estimate the roofline for this chip: BF16 peak TFLOP/s and HBM GB/s, then the achieved figures from the data.
 4. Write your findings to `{report}` as strict JSON with exactly this shape:
 
@@ -214,7 +218,9 @@ only when a tool cannot, and say so.
   "hot_kernels": [
     {{"name": "<kernel as the profiler spells it>", "device_time_ms": 0.0, "share_pct": 0.0,
       "core_type": "<AI_CORE | MIX_AIC | AI_VECTOR_CORE | AICPU>", "category": "gemm | attention | norm | activation | moe | elementwise | other",
-      "mac_ratio": 0.0, "evidence": "...", "optimization": "...", "expected_gain_pct": 0.0,
+      "mac_ratio": 0.0, "evidence": "...",
+      "optimization": "<the change; prefer GEMM tiling/blocking, a weight layout, a PagedAttention or producer-consumer change over a micro-optimization>",
+      "expected_gain_pct": 0.0,
       "source_kind": "library | custom"}}
   ],
   "roofline": {{"peak_tflops_bf16": 0.0, "hbm_gbps": 0.0, "achieved_tflops": 0.0, "achieved_bw_gbps": 0.0}},
@@ -308,8 +314,25 @@ def validate_report(document: object) -> dict[str, Any]:
     return document
 
 
+def _recoverable_share_pct(row: Mapping[str, Any]) -> float:
+    """The share of total device time a candidate could recover: its share times the fraction it can take back.
+
+    ``expected_gain_pct`` is the kernel's own recoverable fraction; an unsized kernel keeps its plain share so it is
+    not buried under the sized ones.
+    """
+    try:
+        share = float(row.get("pct_of_total") or 0.0)
+    except (TypeError, ValueError):
+        share = 0.0
+    try:
+        headroom = float(row.get("expected_gain_pct")) if row.get("expected_gain_pct") is not None else 100.0
+    except (TypeError, ValueError):
+        headroom = 100.0
+    return round(share * max(0.0, min(headroom, 100.0)) / 100.0, 4)
+
+
 def candidates_from_report(report: Mapping[str, Any], *, capture: Capture, framework: str) -> list[dict[str, Any]]:
-    """The router's candidate rows, one per kernel the report ranks."""
+    """The router's candidate rows, ranked by the device time each could recover (not by name)."""
     rows: list[dict[str, Any]] = []
     for kernel in report.get("hot_kernels") or ():
         source_kind = str(kernel.get("source_kind") or "library").strip().lower()
@@ -330,6 +353,9 @@ def candidates_from_report(report: Mapping[str, Any], *, capture: Capture, frame
                 "capture": str(capture.output),
             }
         )
+    for row in rows:
+        row["recoverable_share_pct"] = _recoverable_share_pct(row)
+    rows.sort(key=lambda row: (-row["recoverable_share_pct"], -(row.get("duration_ms") or 0.0), row["kernel_name"]))
     return rows
 
 

@@ -160,3 +160,49 @@ def test_an_analyse_that_leaves_nothing_raises_with_the_call_in_the_message(tmp_
 
     with pytest.raises(route.AnalysisError):
         route.ensure_parsed(capture, python="/bin/false")
+
+
+def test_candidates_are_ranked_by_recoverable_device_time(tmp_path):
+    """A small kernel with real headroom outranks a large one without; name order must not decide."""
+    report = {
+        "hot_kernels": [
+            {
+                "name": "a_gemm_big",
+                "device_time_ms": 2600.0,
+                "share_pct": 79.0,
+                "expected_gain_pct": 5.0,
+                "source_kind": "library",
+                "core_type": "AI_CORE",
+            },
+            {
+                "name": "z_attention",
+                "device_time_ms": 600.0,
+                "share_pct": 12.0,
+                "expected_gain_pct": 60.0,
+                "source_kind": "custom",
+                "core_type": "MIX_AIC",
+            },
+            {
+                "name": "m_norm",
+                "device_time_ms": 180.0,
+                "share_pct": 3.7,
+                "expected_gain_pct": 80.0,
+                "source_kind": "custom",
+                "core_type": "AI_VECTOR_CORE",
+            },
+        ]
+    }
+    capture = route.Capture(
+        root=tmp_path,
+        output=tmp_path,
+        database=None,
+        kernels=tmp_path / "kernel_details.csv",
+        ops=tmp_path / "op_statistic.csv",
+        config=None,
+    )
+
+    rows = route.candidates_from_report(report, capture=capture, framework="vllm")
+
+    assert [row["kernel_name"] for row in rows] == ["z_attention", "a_gemm_big", "m_norm"]
+    assert rows[0]["recoverable_share_pct"] == 7.2
+    assert rows[1]["recoverable_share_pct"] == 3.95
