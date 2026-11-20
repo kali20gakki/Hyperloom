@@ -1,6 +1,9 @@
 # Hyperloom on Ascend NPU
 
 > 中文版（仓库首页）：[README.md](../../README.md)
+>
+> **How to run it end to end: [RUNBOOK.md](RUNBOOK.md)** — environment, one round, a session, the analysis route, a
+> kernel turn, quantization, and the failures worth knowing about.
 
 Status: **bring-up spike**. The measurement, analysis and decision paths run on Ascend NPUs today; the kernel
 and quantization layers are not wired. This document states what runs, how to run it, what changed in the tree, and
@@ -14,9 +17,10 @@ what is still missing.
 | Tool staging on aarch64 | **works** | `StagingProfile.INFERENCEX` stages only the InferenceX subset; the pinned AgentX client CPython is x86_64-only and is no longer required by a round that drives the server itself |
 | One benchmark round (`inference_suite run`) | **works** | boots `vllm serve` (vLLM-Ascend), loads it, writes `report.json` |
 | Capacity measurement and shape comparison (TP1 vs TP2) | **works** | see §6 |
-| Reading a trace and deriving candidates | **works on Ascend** | `analysis_route=msagent`: a model reads the `torch_npu` capture through msprof-mcp under the msAgent profiler skills. TraceLens stays the AMD route |
+| Reading a trace and deriving candidates | **works on Ascend** | `analysis_route=msagent`: a model reads the `torch_npu` capture through msprof-mcp under the msAgent profiler skills, and the candidates are ranked by `recoverable_share_pct` (`share x headroom`), not by name. TraceLens stays the AMD route |
 | Profile capture | **works** | vLLM-Ascend's own `torch_npu.profiler` wrapper, driven by `--profiler-config` and `/start_profile`/`/stop_profile` |
-| Kernel optimization | **not wired** | no Ascend kernel backend in `kernelforge`; kernel work is meant to be delegated (CANNBot workflows) |
+| Kernel optimization | **delegated turn** | `ascend_kernel_agent` reads the ranked candidates and a CANNBot skill tree, edits a serving checkout, and delivers a patch; a patch is accepted only after it applies, imports and serves. One live turn ran end to end and measured no gain — its candidate was 2.8% of device time (§6) |
+| Quantization | **works** | msModelSlim through the agfsm skill tree, driven by the prelude (`--quantize`) or by adopting an existing checkpoint (`HYPERLOOM_QUANTIZED_MODEL`); measured +1.3% over bf16-with-defaults on eight cards (§6) |
 | KEEP/REVERT decisions (`hyperloom optimize`) | **runs end to end** | a 2 h session measured the baseline (1519.8 tok/s) and five seeded candidates, and reverted all five; the stack stayed empty because none cleared the 1% threshold (§6) |
 
 ## 2. Approach
@@ -262,21 +266,28 @@ them — is in [experiments/2026-11-19-qwen3-4b-dp8.md](experiments/2026-11-19-q
 
 - The Ascend analysis route needs an agent CLI, a gateway and an `mcp<2` interpreter for msprof-mcp; none of that is
   in the default install.
-- No candidate has been kept: the parameter layer is saturated on this workload (§6). A gain needs quantization
-  or a different deployment shape, and neither is wired yet.
-- No kernel backend: `kernelforge` has no Ascend C or Triton-Ascend language support, and GEAK has no NPU path.
-- No quantization integration (msModelSlim), no multi-node (HCCL/VLLM topology beyond one node).
+- The parameter layer rewards fixing wrong defaults and little else (§6): three switches gave 9.06% on eight cards,
+  every conventional knob lost. Quantization added 1.3% on top; the kernel turn's single candidate was worth 0.3% of
+  device time by its own estimate and measured inside the noise.
+- No kernel backend inside `kernelforge`: the Ascend path is a delegated turn with its own gates, and the KERNEL
+  phase still dispatches GEAK's handoff protocol, so a session has no caller for it yet — the turn runs from its CLI.
+- The kernel turn needs a git checkout of the serving stack as its patch target; an installed package cannot take a
+  diff.
+- No multi-node (HCCL/VLLM topology beyond one node). Quantization is wired for msModelSlim only; the vendor-neutral
+  scheme enum still resolves to AMD's Quark and is not used on Ascend.
 - The AgentX client environment is x86_64-only (`pins.AGENTX_PYTHON_BUILD`, `client_env.LOCK_PLATFORMS`), so
   AgentX and MLPerf workloads cannot stage on an aarch64 host.
 - CI does not exercise any of this: there is no NPU runner.
 
 ## 8. Next steps
 
-1. **Quantization** — the delegated turn and the prelude addendum are in; what remains is a real W8A8 run through
-   the accuracy gate. Acceptance: a kept candidate above the 1% threshold with accuracy inside the tolerance.
-2. **Kernel delegate hookup** — the delegated turn and its artifact contract are in; the KERNEL phase still routes to
-   GEAK's handoff protocol, so an Ascend session has no caller for it yet. Acceptance: a session that dispatches one
-   candidate to the CANNBot turn, applies the patch, measures it, and records a verdict.
+1. **Quantization's positioning** — the msModelSlim path works end to end (W8A8 added 1.3% over bf16-with-defaults
+   on eight cards). Next: measure it on a larger model or higher concurrency, where weight bytes bind, and raise the
+   accuracy sample count from 64 so the cost is visible.
+2. **Kernel delegate hookup and candidate quality** — the turn produces patches that pass the apply/import/serve
+   gates, but the KERNEL phase still routes to GEAK's handoff protocol, so a session has no caller. Next: wire the
+   phase, and let the analysis keep feeding the large-share candidates (GEMM tiling, PagedAttention) the ranking now
+   puts on top.
 3. **Tensor parallel as a deployment shape** — TP2 is measured at +34.4% but is not a same-shape optimization;
    make the session able to propose it (the base launches at TP1 today) and keep it through the normal verdict.
 3. **Analysis route hardening** — the route exists and a live capture produced `analysis.md` and six candidates,

@@ -4,6 +4,8 @@
 > [docs/ascend/README.md](docs/ascend/README.md)；上游项目原始 README 保留在
 > [README.upstream.md](README.upstream.md)。
 
+> **完整跑通指南（英文，逐步命令 + 排错表）**：[docs/ascend/RUNBOOK.md](docs/ascend/RUNBOOK.md)
+
 状态：**bring-up 阶段**。测量、分析与决策三条链路已经能在昇腾 NPU 上跑通；内核层与量化尚未接通。
 本文说明能跑什么、怎么跑、改了哪些地方，以及还缺什么。
 
@@ -15,9 +17,10 @@
 | aarch64 上的工具 staging | **可运行** | `StagingProfile.INFERENCEX` 只铺 InferenceX 子集；钉死的 AgentX 客户端 CPython 是 x86_64 专用，自行拉起服务的轮次不再需要它 |
 | 单轮基准（`inference_suite run`） | **可运行** | 自己拉起 `vllm serve`（vLLM-Ascend）、压测、写 `report.json` |
 | 容量测量与形态对比（TP1 / TP2） | **可运行** | 见 §6 |
-| 读 trace 派生候选 | **昇腾上可运行** | `analysis_route=msagent`：模型通过 msprof-mcp 与 msAgent profiler 技能读 `torch_npu` 采集；TraceLens 仍是 AMD 路由 |
+| 读 trace 派生候选 | **昇腾上可运行** | `analysis_route=msagent`：模型通过 msprof-mcp 与 msAgent profiler 技能读 `torch_npu` 采集；候选按 `recoverable_share_pct`（占比 × 可优化空间）排序，不再按名字。TraceLens 仍是 AMD 路由 |
 | Profile 采集 | **可运行** | vLLM-Ascend 自带的 `torch_npu.profiler` 封装，由 `--profiler-config` 与 `/start_profile`、`/stop_profile` 驱动 |
-| 算子优化 | **未接通** | `kernelforge` 没有昇腾内核后端；内核工作按委托方式接入（CANNBot 工作流） |
+| 算子优化 | **委托单轮闭环** | `ascend_kernel_agent` 读排序后的候选与 CANNBot 技能树，改 serving 源码树、产出补丁；补丁必须通过“应用 / 导入 / 起服”三道门。一次真实闭环测出：该候选仅占 2.8% 设备时间，实测在噪声内 |
+| 量化 | **可运行** | msModelSlim 经 agfsm 技能树，由前置（`--quantize`）驱动或采纳已有 checkpoint（`HYPERLOOM_QUANTIZED_MODEL`）；8 卡上比 bf16+默认值再 +1.3% |
 | KEEP/REVERT 判定（`hyperloom optimize`） | **端到端跑通** | 一次 2 小时会话测出基线（1519.8 tok/s）和 5 个种子候选，全部 REVERT；栈为空，因为没有候选越过 1% 阈值（见 §6） |
 
 ## 2. 方案
@@ -177,7 +180,36 @@ journalctl -u hl-keep -f            # 脚本自己的日志在脚本旁边
 单卡基线一次 15–20 分钟（加载模型、预热轮 + 测量轮、精度评测），每个候选再加约 7 分钟，所以还要试网格的
 会话需要两小时量级的预算。
 
-## 6. 实测结果
+## 6. 端到端流程速查
+
+五个阶段的速查；每步的完整参数、产物与排错见 [docs/ascend/RUNBOOK.md](docs/ascend/RUNBOOK.md)，
+本文件的 §5 保留各环节的详细用法。
+
+```bash
+# 0. 环境：CANN（自带 bisheng）、venv、网关、msAgent/msprof、可选 CANNBot / msModelSlim 技能树
+source <cann>/set_env.sh; export HYPERLOOM_DEVICE_BACKEND=ascend; export CODEX_MODEL=<网关模型>
+
+# 1. 一轮基准（先确认形态能起服）
+inference_suite resolve --query query.json --gpus 8 --out base_launch.json --user-file serve-8card.sh
+inference_suite run --config config.yaml --run-dir <run dir>
+
+# 2. 优化会话（放 systemd 里，防止被回收）
+systemd-run --unit=hl-run --collect --working-directory=<repo> ./run-keep.sh
+
+# 3. 分析（profile 采集会自动 analyse；也可显式跑）
+python -m hyperloom.orchestrator.trace_analysis.msagent_analysis --trace-dir <capture> --out <dir>
+
+# 4. 算子（CANNBot 委托，三道门：应用 / 导入 / 起服）
+python -m hyperloom.orchestrator.actions.executors.ascend_kernel_agent \
+  --candidates <dir>/kernel_candidates.json --repo <vllm-ascend 源码树> --out <dir> \
+  --serve-model <模型> --port 18070
+
+# 5. 量化（前置驱动 msModelSlim，或采纳已有 checkpoint）
+python -m hyperloom optimize ... --quantize "w8a8"
+export HYPERLOOM_QUANTIZED_MODEL=<checkpoint>
+```
+
+## 7. 实测结果
 
 Qwen3-8B，ISL/OSL 1024，并发 64，128 请求，单节点，prefix cache 保持启动脚本的原样。由
 `inference_suite run` 自身测得：
@@ -245,7 +277,7 @@ GEMM（`aclnnMatmul_MatMulV2`）占设备时间 79%，平均 `aic_mac_ratio` 仅
 8 卡 Qwen3-4B 这次会话的独立记录（环境、逐候选数据、两个 KEEP、期间的主机事故）见
 [docs/ascend/experiments/2026-11-19-qwen3-4b-dp8.md](docs/ascend/experiments/2026-11-19-qwen3-4b-dp8.md)。
 
-## 7. 已知限制
+## 8. 已知限制
 
 - 昇腾分析路由需要 agent CLI、模型网关，以及一个装了 `mcp<2` 的解释器来跑 msprof-mcp；这些都不在默认安装里。
 - 还没有 KEEP：这个负载上参数层已饱和（见 §6）。收益要靠量化或换部署形态，两者都尚未接通。
@@ -255,16 +287,16 @@ GEMM（`aclnnMatmul_MatMulV2`）占设备时间 79%，平均 `aic_mac_ratio` 仅
   AgentX 与 MLPerf 负载无法在 aarch64 主机上 staging。
 - CI 不覆盖这些内容：没有 NPU runner。
 
-## 8. 下一步任务
+## 9. 下一步任务
 
-1. **量化**——msModelSlim W8A8 权重经 vLLM-Ascend 起服，并由精度评测把门。这是 profile 支持的杠杆，也是
-   参数层饱和后剩下的那一个。验收：一个越过 1% 阈值并被 KEEP 的候选，且精度在评测容差内。
-2. **把张量并行作为部署形态**——TP2 已测 +34.4%，但它不是“同形态优化”；让会话能提出它（现在 base 固定
+1. **量化的定位**——msModelSlim 链路已通（8 卡上 W8A8 比 bf16+默认值再 +1.3%），收益量级取决于模型与形态。
+   下一步：换 8B/32B 或更高并发量一遍，确认量化真正的杠杆位置；同时把精度评测从 64 样本提到 128/256。
+2. **算子的调度与候选质量**——委托 turn 已能产出通过三道门（应用/导入/起服）的补丁，但 KERNEL 阶段还没有调用
+   方，且当前候选（2.8% 设备时间）天花板只有零点几个百分点。下一步：接上阶段调度，并让分析侧优先给 GEMM
+   tiling / PagedAttention 这类大占比候选（排序已按 `recoverable_share_pct`）。
+3. **把张量并行作为部署形态**——TP2 已测 +34.4%，但它不是“同形态优化”；让会话能提出它（现在 base 固定
    TP1）并按正常判决保留。
-3. **分析路由加固**——路由已存在，真实采集已产出 `analysis.md` 与 6 个候选（1 个可路由）。还差报告端在等的
-   `kernel_roofline.json` 旁挂文件，以及没有 agent/网关时的确定性回退。
-4. **内核委托**——把热点算子交给 CANNBot 的 Triton-Ascend / Ascend C 工作流，集成结果并做端到端测量。
-   验收：单个算子有可测加速且精度不变。
+4. **分析路由加固**——还差报告端在等的 `kernel_roofline.json` 旁挂文件，以及没有 agent/网关时的确定性回退。
 5. **aarch64 上的 AgentX**——补 aarch64 解释器 pin 与配套客户端 lock，使 `agentx`/`mlperf` 负载能在 arm
    主机上 staging。
 6. **CI**——把 `npu-smi` 解析与 staging 分档的夹具测试放进默认选择，并加一个带标记的 NPU runner 集成任务。
