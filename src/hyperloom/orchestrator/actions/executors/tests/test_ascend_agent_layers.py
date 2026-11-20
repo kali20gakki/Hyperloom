@@ -114,6 +114,7 @@ def test_a_quantize_turn_returns_a_serveable_checkpoint(tmp_path: Path, monkeypa
         checkpoint = out / quantize_agent.CHECKPOINT_DIR
         checkpoint.mkdir(parents=True)
         (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+        (checkpoint / quantize_agent.QUANT_DESCRIPTION).write_text("{}", encoding="utf-8")
         (out / quantize_agent.REPORT_FILENAME).write_text(
             json.dumps({"status": "ok", "checkpoint_path": str(checkpoint), "method": "w8a8 per-tensor"}), "utf-8"
         )
@@ -163,3 +164,23 @@ def test_the_catalog_reads_a_nested_vendor_tree(tmp_path: Path) -> None:
     catalog = kernel_agent._skill_catalog(tmp_path / "cannbot")
 
     assert catalog == ["plugins-community/triton-optimizer/skills/triton-npu-optimize"]
+
+
+def test_an_ok_turn_whose_checkpoint_is_not_quantized_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checkpoint with a config but no quantized tensors is a copy, not a quantization."""
+    model = tmp_path / "model"
+    model.mkdir()
+    out = tmp_path / "out"
+    monkeypatch.setattr(quantize_agent, "agent_argv", lambda *_a, **_kw: ["true"])
+
+    def run(argv: list[str], **_kw: object) -> int:
+        checkpoint = out / quantize_agent.CHECKPOINT_DIR
+        checkpoint.mkdir(parents=True)
+        (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+        (out / quantize_agent.REPORT_FILENAME).write_text(json.dumps({"status": "ok"}), encoding="utf-8")
+        return 0
+
+    with pytest.raises(quantize_agent.QuantizeAgentError):
+        quantize_agent.run_quantize_agent(model, out, skills=None, run_agent=run)

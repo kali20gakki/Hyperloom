@@ -66,6 +66,27 @@ async def _run_quantization_prelude(args: argparse.Namespace) -> None:
         )
         return
 
+    adopted = (os.environ.get("HYPERLOOM_QUANTIZED_MODEL") or "").strip()
+    if adopted:
+        # A checkpoint the operator already produced with the vendor tool (validated here, not re-quantized): the
+        # session then measures the quantized model without depending on a fresh agent turn.
+        from hyperloom.orchestrator.actions.executors.ascend_quantize_agent import (
+            QuantizeAgentError,
+            validate_checkpoint,
+        )
+
+        checkpoint = Path(adopted)
+        source_name = Path(str(args.model)).name
+        try:
+            validate_checkpoint(checkpoint.parent, {"status": "ok", "checkpoint_path": str(checkpoint)})
+        except QuantizeAgentError as exc:
+            raise SystemExit(f"HYPERLOOM_QUANTIZED_MODEL={adopted} is not a usable quantized checkpoint: {exc}")
+        args.model = checkpoint
+        os.environ["MODEL_PATH"] = str(checkpoint)
+        args.model_display_name = f"{source_name}-quantized"
+        print(f"Quantization prelude: adopting pre-quantized checkpoint {checkpoint}")
+        return
+
     from ..session.paths import workspace_root
 
     source_model = str(args.model)

@@ -26,6 +26,9 @@ log = logging.getLogger(__name__)
 SKILLS_ROOT_ENV = "HYPERLOOM_AGFSM_SKILLS"
 #: The exported checkpoint directory the agent writes; a round then serves this path instead of the source model.
 CHECKPOINT_DIR = "checkpoint"
+#: What msModelSlim writes beside the checkpoint: the per-tensor quant config, and the quantized weight files.
+QUANT_DESCRIPTION = "quant_model_description.json"
+QUANT_WEIGHTS_GLOB = "quant_model_weight_*.safetensors"
 REPORT_FILENAME = "quantize_report.json"
 REPORT_SCHEMA = "hyperloom-ascend-quantize/1"
 DEFAULT_TIMEOUT_SEC = 7200.0
@@ -52,6 +55,13 @@ def _skill_catalog(root: Path) -> list[str]:
     return sorted(set(flat) | set(nested))
 
 
+#: Where the msModelSlim checkout sits, when the operator has one; the prompt names it so the turn need not hunt.
+MSMODELSLIM_ROOT_ENV = "HYPERLOOM_MSMODELSLIM"
+#: An interpreter that already has msModelSlim (and torch_npu) installed; preferred over putting the source on
+#: PYTHONPATH.
+MSMODELSLIM_PYTHON_ENV = "HYPERLOOM_MSMODELSLIM_PYTHON"
+
+
 def prompt_addendum(*, skills: Path | None = None) -> str:
     """The Ascend instruction a quantization turn needs: msModelSlim through its skill tree, exported for vLLM.
 
@@ -60,6 +70,14 @@ def prompt_addendum(*, skills: Path | None = None) -> str:
     """
     root = skills if skills is not None else skills_root()
     catalog = _skill_catalog(root) if root else []
+    source = (os.environ.get(MSMODELSLIM_ROOT_ENV) or "").strip()
+    interpreter = (os.environ.get(MSMODELSLIM_PYTHON_ENV) or "").strip()
+    where_source = f"The msModelSlim checkout is {source}. " if source else ""
+    where_python = (
+        f"An interpreter with msModelSlim installed is {interpreter}; use it instead of installing anything. "
+        if interpreter
+        else ""
+    )
     where = (
         f"Read the `SKILL.md` under {root} first (skills: {', '.join(catalog)}) and follow its workflow."
         if catalog
@@ -67,9 +85,17 @@ def prompt_addendum(*, skills: Path | None = None) -> str:
     )
     return (
         "On this Ascend host, quantize with msModelSlim. "
+        f"{where_python}{where_source}"
         f"{where} "
-        "Export a HuggingFace-format checkpoint that `vllm serve <dir>` loads on vLLM-Ascend (weights, config and "
-        "tokenizer together), and keep the recipe you used in the report."
+        "Run it from a directory you own and can write: msModelSlim writes `features.npy` into the working directory "
+        "and refuses to run when that directory is owned by another user (`Current user doesn't have writen "
+        "permission`). Point `PYTHONPATH` at the msModelSlim source instead of installing it, and use the NPU: "
+        "`--device_type npu` finishes a 4B model in minutes where `cpu` takes tens. A Qwen3 checkpoint quantizes as "
+        "`python example/Qwen/quant_qwen.py --model_path <model> --save_directory <dir> --device_type npu "
+        "--model_type qwen3 --w_bit 8 --a_bit 8 --trust_remote_code True`. "
+        "Export a HuggingFace-format checkpoint that `vllm serve <dir> --quantization ascend` loads on vLLM-Ascend "
+        "(the `quant_model_weight_w8a8.safetensors`, the config, and the tokenizer together), and keep the recipe you "
+        "used in the report."
     )
 
 
@@ -97,9 +123,12 @@ Inputs
 
 Task
 1. Follow the skill's workflow to quantize the source model with msModelSlim. Do not invent a recipe: use the one the
-   skill prescribes for a Qwen-style dense model, and record it.
-2. Export the checkpoint so that `vllm serve {out_dir / CHECKPOINT_DIR}` works: the export must carry the tokenizer
-   and config files, not only the weights.
+   skill prescribes for a Qwen-style dense model, and record it. msModelSlim source can stay where it is — put it on
+   `PYTHONPATH` rather than installing it — and run it with `--device_type npu` from a directory you own: it writes
+   `features.npy` into the working directory and refuses a directory another user owns.
+2. Export the checkpoint so that `vllm serve {out_dir / CHECKPOINT_DIR} --quantization ascend` works: the export must
+   carry `config.json`, the tokenizer files, and the quantized weights msModelSlim writes
+   (`quant_model_weight_w8a8.safetensors` with its `quant_model_description.json`), not only the weights.
 3. Write `{out_dir / REPORT_FILENAME}`:
    {{"schema": "{REPORT_SCHEMA}", "status": "ok"|"skipped", "checkpoint_path": "{out_dir / CHECKPOINT_DIR}",
      "method": "<recipe name and precision>", "source_model": "{model}",
@@ -127,6 +156,10 @@ def validate_checkpoint(out_dir: Path, report: dict[str, Any]) -> dict[str, Any]
         checkpoint = Path(str(report.get("checkpoint_path") or out_dir / CHECKPOINT_DIR))
         if not (checkpoint / "config.json").is_file():
             raise QuantizeAgentError(f"status ok but {checkpoint} holds no config.json")
+        # msModelSlim writes the quantized tensors beside their description; a checkpoint without them is not
+        # quantized, whatever its config says.
+        if not (checkpoint / QUANT_DESCRIPTION).is_file() and not list(checkpoint.glob(QUANT_WEIGHTS_GLOB)):
+            raise QuantizeAgentError(f"status ok but {checkpoint} holds no {QUANT_DESCRIPTION} or quantized weights")
         report["checkpoint_path"] = str(checkpoint)
     return report
 
